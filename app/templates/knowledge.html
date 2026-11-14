@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+
+{% block title %}Knowledge documents{% endblock %}
+
+{% block content %}
+<section class="page-heading">
+  <div>
+    <p class="eyebrow">Admin workspace</p>
+    <h1>Knowledge documents</h1>
+    <p class="page-lede">Review document indexing status and add source material for support answers.</p>
+  </div>
+</section>
+
+{% if error %}
+<div class="alert alert-error" role="alert"><strong>Upload failed.</strong> {{ error }}</div>
+{% endif %}
+{% if success %}
+<div class="alert alert-success" role="status"><strong>Upload complete.</strong> {{ success }}</div>
+{% endif %}
+
+<section class="panel-card upload-card" aria-labelledby="upload-title">
+  <div class="section-heading">
+    <div><p class="eyebrow">Add a source</p><h2 id="upload-title">Upload a document</h2></div>
+  </div>
+  <form method="post" action="/ui/knowledge/upload" enctype="multipart/form-data"
+        class="upload-form" hx-boost="false">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="field file-field">
+      <label for="knowledge-file">Choose a PDF, TXT, or Markdown file</label>
+      <input id="knowledge-file" name="file" type="file" required
+             accept=".pdf,.txt,.md,application/pdf,text/plain,text/markdown">
+      <p class="field-hint">Maximum file size: 10 MB. The document must contain extractable text to be indexed.</p>
+    </div>
+    <button class="button button-primary" type="submit">Upload and index</button>
+  </form>
+</section>
+
+<section class="documents-section" aria-labelledby="documents-title">
+  <div class="results-heading">
+    <div><h2 id="documents-title">Documents</h2><p class="muted">Metadata and indexing status only; document contents are not displayed.</p></div>
+    <span class="count-badge">{{ documents|length }} total</span>
+  </div>
+  {% if documents %}
+  <div class="panel-card document-table-wrap">
+    <table class="document-table">
+      <caption class="visually-hidden">Knowledge document metadata and indexing status</caption>
+      <thead><tr><th scope="col">Document</th><th scope="col">Status</th><th scope="col">Added</th></tr></thead>
+      <tbody>
+      {% for document in documents %}
+        <tr>
+          <th scope="row">
+            <span class="document-title">{{ document.title }}</span>
+            {% if document.source_name and document.source_name != document.title %}<span class="document-source">{{ document.source_name }}</span>{% endif %}
+          </th>
+          <td><span class="status-pill status-{{ document.status }}">{{ document.status|replace('_', ' ')|title }}</span></td>
+          <td><time datetime="{{ document.created_at.isoformat() }}">{{ document.created_at.strftime('%b %d, %Y · %H:%M UTC') }}</time></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty-state panel-card">
+    <span class="empty-icon" aria-hidden="true">▤</span>
+    <h3>No knowledge documents yet</h3>
+    <p>Uploaded documents will appear here with their indexing status.</p>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

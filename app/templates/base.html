@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>{% block title %}Service desk{% endblock %} · Service desk</title>
+  <link rel="stylesheet" href="/ui/static/panel.css">
+  <script src="/ui/static/htmx.min.js" defer></script>
+</head>
+<body hx-boost="true" hx-indicator="#request-status">
+  <a class="skip-link" href="#main-content">Skip to main content</a>
+  {% if role is defined %}
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="/ui/tickets" aria-label="Service desk home">
+        <span class="brand-mark" aria-hidden="true">SD</span>
+        <span>Service desk</span>
+      </a>
+      <nav class="primary-nav" aria-label="Main navigation">
+        <a href="/ui/tickets" {% if request.url.path == '/ui/tickets' %}aria-current="page"{% endif %}>Tickets</a>
+        {% if role == 'admin' %}
+        <a href="/ui/knowledge" {% if request.url.path == '/ui/knowledge' %}aria-current="page"{% endif %}>Knowledge</a>
+        {% endif %}
+      </nav>
+      <div class="account-area">
+        <span class="role-badge">{{ role|title }}</span>
+        <form method="post" action="/ui/logout" class="logout-form" hx-boost="false">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="button button-quiet">Sign out</button>
+        </form>
+      </div>
+    </div>
+  </header>
+  {% endif %}
+  <div id="request-status" class="request-status htmx-indicator" role="status" aria-live="polite">
+    <span class="spinner" aria-hidden="true"></span> Loading…
+  </div>
+  <main id="main-content" class="main-content">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="site-footer">
+    <span>Internal service desk</span>
+    <span>For authorized support staff</span>
+  </footer>
+</body>
+</html>

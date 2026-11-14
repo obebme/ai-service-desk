@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+
+{% block title %}Ticket queue{% endblock %}
+
+{% block content %}
+<section class="page-heading">
+  <div>
+    <p class="eyebrow">Support workspace</p>
+    <h1>Ticket queue</h1>
+    <p class="page-lede">Review requests and open a ticket to respond or update it.</p>
+  </div>
+</section>
+
+<section class="panel-card queue-tools" aria-labelledby="telegram-processing-title">
+  <h2 id="telegram-processing-title">Telegram processing</h2>
+  <dl class="facts-list">
+    <div><dt>Awaiting completion</dt><dd>{{ pending_count }}</dd></div>
+    <div><dt>Oldest pending request</dt><dd>{{ oldest_pending_age }}</dd></div>
+    <div><dt>Unconfirmed automatic replies</dt><dd>{{ unconfirmed_count }}</dd></div>
+  </dl>
+</section>
+
+<section class="panel-card queue-tools" aria-labelledby="queue-search-title">
+  <div class="section-heading">
+    <div>
+      <h2 id="queue-search-title">Find tickets</h2>
+      <p class="muted">Search by ticket number, subject, or description.</p>
+    </div>
+  </div>
+  <form method="get" action="/ui/tickets" class="filter-form">
+    <div class="field search-field">
+      <label for="ticket-search">Search tickets</label>
+      <input id="ticket-search" type="search" name="q" value="{{ q }}" maxlength="200"
+             placeholder="Ticket number, subject, or description">
+    </div>
+    <div class="field status-field">
+      <label for="status-filter">Status</label>
+      <select id="status-filter" name="status">
+        <option value="">All statuses</option>
+        {% for value, label in [('open', 'Open'), ('in_progress', 'In progress'), ('waiting_for_user', 'Waiting for user'), ('resolved', 'Resolved'), ('closed', 'Closed')] %}
+        <option value="{{ value }}" {% if status == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label for="attention-filter">Needs attention</label>
+      <select id="attention-filter" name="attention">
+        <option value="">All tickets</option>
+        {% if agent %}<option value="mine" {% if attention == 'mine' %}selected{% endif %}>My tickets</option>{% endif %}
+        <option value="unassigned" {% if attention == 'unassigned' %}selected{% endif %}>Unassigned</option>
+        <option value="reply" {% if attention == 'reply' %}selected{% endif %}>Waiting for a reply</option>
+        <option value="delivery" {% if attention == 'delivery' %}selected{% endif %}>Unconfirmed automatic reply</option>
+      </select>
+    </div>
+    <div class="filter-actions">
+      <button class="button button-primary" type="submit">Apply filters</button>
+      {% if q or status or attention %}<a class="button button-quiet" href="/ui/tickets">Clear</a>{% endif %}
+    </div>
+  </form>
+</section>
+
+<section class="queue-results" aria-labelledby="results-title" aria-live="polite">
+  <div class="results-heading">
+    <h2 id="results-title">Results</h2>
+    <p class="result-count">
+      <strong>{{ total_count }}</strong> matching {{ 'ticket' if total_count == 1 else 'tickets' }}
+    </p>
+  </div>
+  {% if tickets %}
+  <div class="ticket-list">
+    {% for ticket in tickets %}
+    <article class="ticket-card">
+      <div class="ticket-card-main">
+        <div class="ticket-meta">
+          <span class="ticket-number">{{ ticket.ticket_number }}</span>
+          <span class="status-pill status-{{ ticket.status }}">{{ ticket.status|replace('_', ' ')|title }}</span>
+          {% if ticket.id in unconfirmed_ticket_ids %}
+          <span class="status-pill">Automatic reply unconfirmed</span>
+          {% endif %}
+        </div>
+        <h3><a href="/ui/tickets/{{ ticket.id }}">{{ ticket.subject }}</a></h3>
+        <p class="ticket-summary">{{ ticket.description }}</p>
+        <p class="ticket-submeta">
+          <span>Priority: <strong>{{ ticket.priority|title }}</strong></span>
+          <span>{{ ticket.assigned_agent or "Unassigned" }}</span>
+          <span>Updated <time datetime="{{ ticket.updated_at.isoformat() }}">{{ ticket.updated_at.strftime('%b %d, %Y · %H:%M UTC') }}</time></span>
+        </p>
+      </div>
+      <a class="button button-secondary ticket-open" href="/ui/tickets/{{ ticket.id }}">Open ticket<span class="visually-hidden"> {{ ticket.ticket_number }}</span></a>
+    </article>
+    {% endfor %}
+  </div>
+  {% elif q %}
+  <div class="empty-state panel-card">
+    <span class="empty-icon" aria-hidden="true">⌕</span>
+    <h3>No matching tickets</h3>
+    <p>Try another term or clear your filters.</p>
+    <a class="button button-secondary" href="/ui/tickets">Clear search</a>
+  </div>
+  {% else %}
+  <div class="empty-state panel-card">
+    <span class="empty-icon" aria-hidden="true">✓</span>
+    <h3>No tickets in this view</h3>
+    <p>{% if status %}There are no tickets with this status. Choose another status or clear the filter.{% else %}There are no tickets to display.{% endif %}</p>
+    {% if status %}<a class="button button-secondary" href="/ui/tickets">Show all statuses</a>{% endif %}
+  </div>
+  {% endif %}
+  {% if page_count > 1 %}
+  <nav class="filter-actions" aria-label="Ticket pages">
+    {% if previous_url %}<a class="button button-secondary" href="{{ previous_url }}" rel="prev">Previous</a>{% endif %}
+    <span>Page {{ page }} of {{ page_count }}</span>
+    {% if next_url %}<a class="button button-secondary" href="{{ next_url }}" rel="next">Next</a>{% endif %}
+  </nav>
+  {% endif %}
+</section>
+{% endblock %}

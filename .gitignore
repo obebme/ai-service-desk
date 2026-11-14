@@ -1,0 +1,45 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+credentials.json
+secrets/
+
+# Local data, backups and generated files
+*.dump
+*.backup
+*.sql.gz
+*.sqlite*
+*.db
+*.log
+/outputs/
+/work/
+/pgdata/
+/n8ndata/
+/backups/
+
+# Python and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+.coverage*
+htmlcov/
+build/
+dist/
+
+# Local editor settings and agent files
+/.vscode/
+/.idea/
+/.github/agents/
+.DS_Store
+Thumbs.db

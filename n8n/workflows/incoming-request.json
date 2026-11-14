@@ -1,0 +1,59 @@
+{
+  "name": "AI Service Desk — Incoming Request",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "service-desk-incoming",
+        "authentication": "headerAuth",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "c44e31b4-0bdc-4af5-9818-22b7218892c9",
+      "name": "Incoming Message",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "service-desk-incoming",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "SET_IN_N8N",
+          "name": "Service Desk ingress token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/api/v1/internal/process-message",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ message_id: $json.body.message_id }) }}",
+        "options": {}
+      },
+      "id": "387bdba2-06eb-4cff-ad83-99ec86db4ab1",
+      "name": "Process with Service Desk API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [500, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "SET_IN_N8N",
+          "name": "Service Desk workflow token"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Incoming Message": {
+      "main": [[{"node": "Process with Service Desk API", "type": "main", "index": 0}]]
+    }
+  },
+  "active": false,
+  "settings": {"executionOrder": "v1"},
+  "versionId": "3988aadb-4424-4d77-a07b-83d3f188ca24",
+  "meta": {"templateCredsSetupCompleted": false},
+  "tags": []
+}

@@ -1,0 +1,848 @@
+openapi: 3.1.0
+info:
+  title: AI Service Desk MVP API
+  version: 0.1.0
+  description: >
+    Approved contract for the MVP and Agent/Admin panel, including the approved behavior
+    for notifying Telegram private-chat requesters after panel replies. User access requires a
+    personal Bearer token bound to the supplied X-Telegram-User-ID.
+    The /ui routes are same-origin server-rendered Agent/Admin pages. Production
+    deployment requires HTTPS and trusted-network enforcement at the ingress.
+servers:
+  - url: http://localhost:8000
+security: []
+tags:
+  - name: Tickets
+  - name: Knowledge
+  - name: AI
+  - name: Integrations
+  - name: Health
+  - name: Panel
+paths:
+  /ui/login:
+    get:
+      tags: [Panel]
+      operationId: panelLoginPage
+      description: Returns the login form and a short-lived CSRF challenge.
+      responses:
+        "200":
+          description: Login form; authenticated sessions are redirected to the ticket queue.
+          content:
+            text/html:
+              schema:
+                type: string
+          headers:
+            Set-Cookie:
+              description: Short-lived HttpOnly; Secure; SameSite=Lax login CSRF challenge.
+              schema:
+                type: string
+        "303":
+          description: Valid existing session; redirect to /ui/tickets.
+    post:
+      tags: [Panel]
+      operationId: panelLogin
+      description: >
+        Validates an existing Agent/Admin role Bearer token on the server. Never log
+        or return the submitted token. On success, sets a signed 8-hour session cookie
+        containing role, CSRF token, and expiry only; the Bearer token is not stored.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [role_token, csrf_token]
+              properties:
+                role_token:
+                  type: string
+                  format: password
+                  writeOnly: true
+                csrf_token:
+                  type: string
+      parameters:
+        - name: servicedesk_login_challenge
+          in: cookie
+          required: true
+          description: Short-lived signed challenge issued by GET /ui/login.
+          schema:
+            type: string
+      responses:
+        "303":
+          description: Login succeeded; redirect to /ui/tickets and set session cookie.
+          headers:
+            Set-Cookie:
+              description: HttpOnly; Secure; SameSite=Lax signed session cookie.
+              schema:
+                type: string
+        "400":
+          description: Invalid or missing CSRF challenge.
+        "401":
+          description: Invalid credential; response must not reveal which role token failed.
+  /ui/logout:
+    post:
+      tags: [Panel]
+      operationId: panelLogout
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [csrf_token]
+              properties:
+                csrf_token:
+                  type: string
+      responses:
+        "303":
+          description: Session cookie cleared; redirect to /ui/login.
+          headers:
+            Set-Cookie:
+              description: Expired session cookie.
+              schema:
+                type: string
+        "400":
+          description: Invalid CSRF token.
+  /ui/tickets:
+    get:
+      tags: [Panel]
+      operationId: panelTicketQueue
+      security:
+        - sessionCookie: []
+      description: >
+        Agent/Admin queue. Status filtering uses the existing API; q is searched
+        only against the returned latest set of at most 100 records, not the full
+        database. The result count and search limitation must be visible in the UI.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [open, in_progress, waiting_for_user, resolved, closed]
+        - name: q
+          in: query
+          required: false
+          description: Local search in ticket number, subject, and description only.
+          schema:
+            type: string
+            maxLength: 200
+      responses:
+        "200":
+          description: Rendered queue page.
+          content:
+            text/html:
+              schema:
+                type: string
+        "303":
+          description: Missing or expired session; redirect to /ui/login.
+        "422":
+          $ref: "#/components/responses/ValidationError"
+  /ui/tickets/{ticket_id}:
+    get:
+      tags: [Panel]
+      operationId: panelTicketDetail
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/TicketId"
+      responses:
+        "200":
+          description: Rendered ticket detail and chronological message history.
+          content:
+            text/html:
+              schema:
+                type: string
+        "303":
+          description: Missing or expired session; redirect to /ui/login.
+        "404":
+          description: Ticket not found.
+        "422":
+          $ref: "#/components/responses/ValidationError"
+  /ui/tickets/{ticket_id}/messages:
+    post:
+      tags: [Panel]
+      operationId: panelAddTicketMessage
+      description: >
+        Save a panel reply and redirect to the ticket detail page. Approved behavior,
+        implementation pending: for eligible Telegram private-chat tickets, replies
+        up to 4,000 characters are saved before one sendMessage attempt to the stored
+        webhook-derived chat ID. The redirect shows save and delivery results separately.
+        No new public JSON endpoint or request field is added.
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/TicketId"
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [body, csrf_token]
+              properties:
+                body:
+                  type: string
+                  minLength: 1
+                  maxLength: 20000
+                  description: >
+                    For eligible Telegram private-chat tickets, values longer than 4,000
+                    characters are rejected before message persistence; other panel
+                    replies retain the existing 20,000-character limit.
+                csrf_token:
+                  type: string
+      responses:
+        "303":
+          description: >
+            Message saved and redirect to ticket detail with delivery outcome when
+            applicable, or missing/expired session redirects to /ui/login.
+          headers:
+            Location:
+              schema:
+                type: string
+        "400":
+          description: Invalid CSRF token.
+        "404":
+          description: Ticket not found.
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          description: >
+            Backend unavailable before message persistence. Telegram delivery failure
+            after the reply is saved is shown on redirect and is not reported as a
+            failed message submission.
+  /ui/tickets/{ticket_id}/update:
+    post:
+      tags: [Panel]
+      operationId: panelUpdateTicket
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/TicketId"
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [csrf_token]
+              properties:
+                csrf_token:
+                  type: string
+                status:
+                  type: string
+                  enum: [open, in_progress, waiting_for_user, resolved, closed]
+                priority:
+                  type: string
+                  enum: [low, medium, high, critical]
+                resolution:
+                  type: string
+                  maxLength: 20000
+                  description: Empty value clears the resolution.
+      responses:
+        "303":
+          description: Ticket updated and redirect to detail, or missing/expired session redirects to /ui/login.
+          headers:
+            Location:
+              schema:
+                type: string
+        "400":
+          description: Invalid CSRF token.
+        "403":
+          description: Role is not permitted to update tickets.
+        "404":
+          description: Ticket not found.
+        "422":
+          $ref: "#/components/responses/ValidationError"
+  /ui/knowledge:
+    get:
+      tags: [Panel]
+      operationId: panelKnowledgeDocuments
+      security:
+        - sessionCookie: []
+      description: Admin-only page; Agent is denied server-side.
+      responses:
+        "200":
+          description: Rendered knowledge-document metadata list.
+          content:
+            text/html:
+              schema:
+                type: string
+        "303":
+          description: Missing or expired session; redirect to /ui/login.
+        "403":
+          description: Admin role required.
+  /ui/knowledge/upload:
+    post:
+      tags: [Panel]
+      operationId: panelUploadKnowledgeDocument
+      security:
+        - sessionCookie: []
+      description: Admin-only upload; uses existing PDF/TXT/Markdown and 10 MB API limits.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [file, csrf_token]
+              properties:
+                csrf_token:
+                  type: string
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "303":
+          description: Upload completed with result, or missing/expired session redirects to /ui/login.
+          headers:
+            Location:
+              schema:
+                type: string
+        "400":
+          description: Invalid CSRF token or document has no extractable text.
+        "411":
+          description: Content-Length is required for upload requests.
+        "403":
+          description: Admin role required.
+        "413":
+          description: File exceeds 10 MB or multipart request exceeds the bounded body size.
+        "415":
+          description: Unsupported file type.
+        "503":
+          description: Embedding service unavailable or indexing failed.
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: liveHealth
+      responses:
+        "200":
+          description: Process is running.
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: readyHealth
+      responses:
+        "200":
+          description: Database is reachable.
+  /api/v1/tickets:
+    post:
+      tags: [Tickets]
+      operationId: createTicket
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/TelegramUserId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TicketCreate"
+      responses:
+        "201":
+          description: Ticket and initial message created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ticket"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+    get:
+      tags: [Tickets]
+      operationId: listTickets
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/TelegramUserId"
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: At most 100 tickets, newest first; User results are owner-scoped.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Ticket"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/v1/tickets/{ticket_id}:
+    parameters:
+      - $ref: "#/components/parameters/TicketId"
+    get:
+      tags: [Tickets]
+      operationId: getTicket
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/TelegramUserId"
+      responses:
+        "200":
+          description: Ticket found and accessible.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ticket"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Tickets]
+      operationId: updateTicket
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TicketPatch"
+      responses:
+        "200":
+          description: Ticket updated and audit event recorded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ticket"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+  /api/v1/tickets/{ticket_id}/messages:
+    parameters:
+      - $ref: "#/components/parameters/TicketId"
+    get:
+      tags: [Tickets]
+      operationId: listTicketMessages
+      description: Implemented. Returns chronological messages; User must own the ticket.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/TelegramUserId"
+      responses:
+        "200":
+          description: Messages in chronological order; User must own the ticket.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Message"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [Tickets]
+      operationId: addTicketMessage
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/TelegramUserId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MessageCreate"
+      responses:
+        "201":
+          description: Message created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageCreated"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+  /api/v1/ai/analyze:
+    post:
+      tags: [AI]
+      operationId: analyzeMessage
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MessageCreate"
+      responses:
+        "200":
+          description: Classification result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Analysis"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          description: AI service unavailable.
+  /api/v1/knowledge/documents:
+    get:
+      tags: [Knowledge]
+      operationId: listKnowledgeDocuments
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Knowledge document metadata.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/KnowledgeDocument"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Knowledge]
+      operationId: uploadKnowledgeDocument
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "201":
+          description: Document indexed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KnowledgeUploadResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "411":
+          description: Content-Length is required for upload requests.
+        "413":
+          description: File exceeds 10 MB or multipart request exceeds the bounded body size.
+        "415":
+          description: Unsupported file type.
+        "503":
+          description: Embedding service unavailable or indexing failed.
+  /api/v1/analytics/overview:
+    get:
+      tags: [Tickets]
+      operationId: ticketOverview
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Ticket counts grouped by status.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: integer
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /integrations/telegram/webhook:
+    post:
+      tags: [Integrations]
+      operationId: telegramWebhook
+      parameters:
+        - name: X-Telegram-Bot-Api-Secret-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Telegram Bot API update payload.
+              additionalProperties: true
+      responses:
+        "200":
+          description: Update durably queued, recognized as a duplicate, or ignored if non-text.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/v1/internal/process-message:
+    post:
+      tags: [Integrations]
+      operationId: processWorkflowMessage
+      parameters:
+        - name: X-Workflow-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message_id]
+              properties:
+                message_id:
+                  type: string
+                  format: uuid
+      responses:
+        "200":
+          description: Message processed or its saved reply returned.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: servicedesk_session
+  parameters:
+    TelegramUserId:
+      name: X-Telegram-User-ID
+      in: header
+      required: false
+      description: Required for the User role and must match the identity bound to the Bearer token.
+      schema:
+        type: string
+        maxLength: 80
+    TicketId:
+      name: ticket_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  responses:
+    Unauthorized:
+      description: Missing or invalid credential.
+    Forbidden:
+      description: Authenticated role is not permitted.
+    NotFound:
+      description: Resource not found or not accessible to this User.
+    BadRequest:
+      description: Invalid request.
+    ValidationError:
+      description: Request schema validation failed.
+  schemas:
+    TicketCreate:
+      type: object
+      additionalProperties: false
+      required: [subject, description]
+      properties:
+        subject:
+          type: string
+          minLength: 3
+          maxLength: 240
+        description:
+          type: string
+          minLength: 1
+          maxLength: 20000
+        category:
+          type: string
+          default: other
+        subcategory:
+          type: string
+          default: other
+        priority:
+          type: string
+          enum: [low, medium, high, critical]
+          default: medium
+    TicketPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        status:
+          type: string
+          enum: [open, in_progress, waiting_for_user, resolved, closed]
+        priority:
+          type: string
+          enum: [low, medium, high, critical]
+        resolution:
+          type: [string, "null"]
+          maxLength: 20000
+    Ticket:
+      type: object
+      required:
+        - id
+        - ticket_number
+        - requester_id
+        - category
+        - subcategory
+        - priority
+        - status
+        - subject
+        - description
+        - resolution
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        ticket_number:
+          type: string
+        requester_id:
+          type: string
+          format: uuid
+        category:
+          type: string
+        subcategory:
+          type: string
+        priority:
+          type: string
+        status:
+          type: string
+        subject:
+          type: string
+        description:
+          type: string
+        resolution:
+          type: [string, "null"]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    MessageCreate:
+      type: object
+      additionalProperties: false
+      required: [body]
+      properties:
+        body:
+          type: string
+          minLength: 1
+          maxLength: 20000
+    Message:
+      type: object
+      required: [id, ticket_id, sender_type, body, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        ticket_id:
+          type: [string, "null"]
+          format: uuid
+        sender_type:
+          type: string
+          enum: [user, agent]
+        body:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    MessageCreated:
+      type: object
+      required: [id, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+    Analysis:
+      type: object
+      required: [summary, confidence, suggested_action]
+      properties:
+        category:
+          type: string
+          enum: [network, account, hardware, software, security, other]
+          default: other
+        subcategory:
+          type: string
+          enum: [vpn, internet, authentication, printer, software, security, other]
+          default: other
+        priority:
+          type: string
+          enum: [low, medium, high, critical]
+          default: medium
+        summary:
+          type: string
+        sentiment:
+          type: string
+          enum: [negative, neutral, positive]
+          default: neutral
+        needs_human:
+          type: boolean
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        suggested_action:
+          type: string
+    KnowledgeDocument:
+      type: object
+      required: [id, title, source_name, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        source_name:
+          type: string
+        status:
+          type: string
+    KnowledgeUploadResult:
+      allOf:
+        - $ref: "#/components/schemas/KnowledgeDocument"
+        - type: object
+          required: [chunks]
+          properties:
+            chunks:
+              type: integer
+              minimum: 0

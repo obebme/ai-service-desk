@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+
+{% block title %}{{ ticket.ticket_number }}{% endblock %}
+
+{% block content %}
+<nav class="breadcrumbs" aria-label="Breadcrumb">
+  <a href="/ui/tickets">Ticket queue</a><span aria-hidden="true">/</span><span aria-current="page">{{ ticket.ticket_number }}</span>
+</nav>
+<section class="detail-heading">
+  <div>
+    <div class="ticket-meta">
+      <span class="ticket-number">{{ ticket.ticket_number }}</span>
+      <span class="status-pill status-{{ ticket.status }}">{{ ticket.status|replace('_', ' ')|title }}</span>
+    </div>
+    <h1>{{ ticket.subject }}</h1>
+    <p class="muted">Created <time datetime="{{ ticket.created_at.isoformat() }}">{{ ticket.created_at.strftime('%b %d, %Y · %H:%M UTC') }}</time>
+      <span aria-hidden="true"> · </span>Updated <time datetime="{{ ticket.updated_at.isoformat() }}">{{ ticket.updated_at.strftime('%b %d, %Y · %H:%M UTC') }}</time></p>
+  </div>
+  <a class="button button-secondary" href="/ui/tickets">Back to queue</a>
+</section>
+
+{% if error %}
+<div class="alert alert-error" role="alert">{{ error }}</div>
+{% endif %}
+{% if feedback_message %}
+<div class="alert" role="status">
+  <strong>Message saved.</strong>
+  Delivery:
+  {% if feedback_message.telegram_delivery_status == 'accepted' %}
+    Telegram API accepted the message.
+  {% elif feedback_message.telegram_delivery_status == 'unconfirmed' %}
+    Unconfirmed — Telegram delivery was not confirmed.
+  {% elif feedback_message.telegram_delivery_status == 'pending' %}
+    Pending — delivery is not confirmed.
+  {% elif feedback_message.telegram_delivery_status == 'not_configured' %}
+    Not configured — Telegram delivery was not attempted.
+  {% else %}
+    Not applicable — this ticket has no eligible private Telegram recipient.
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="detail-grid">
+  <div class="detail-primary">
+    <section class="panel-card conversation" aria-labelledby="conversation-title">
+      <div class="section-heading">
+        <div><p class="eyebrow">Ticket history</p><h2 id="conversation-title">Conversation</h2></div>
+        <span class="muted">{{ messages|length }} {{ 'message' if messages|length == 1 else 'messages' }}</span>
+      </div>
+      {% if messages %}
+      <ol class="message-list">
+        {% for message in messages %}
+        <li class="message message-{{ message.sender_type }}">
+          <div class="message-heading">
+            <strong>{{ 'Support agent' if message.sender_type == 'agent' else 'User' }}</strong>
+            <time datetime="{{ message.created_at.isoformat() }}">{{ message.created_at.strftime('%b %d, %Y · %H:%M UTC') }}</time>
+          </div>
+          <p class="message-body">{{ message.body }}</p>
+          {% if message.analysis and message.analysis.photo_id %}
+          <a hx-boost="false" href="/ui/tickets/{{ ticket.id }}/photos/{{ message.id }}">Open screenshot</a>
+          {% endif %}
+          {% if message.analysis and message.analysis.escalation_reason %}
+          {% set reasons = {'critical': 'Critical request', 'requires_specialist': 'Specialist required',
+            'low_confidence': 'Low classification confidence', 'no_relevant_passages': 'No relevant articles',
+            'no_confirmed_solution': 'No confirmed solution', 'ai_error': 'AI processing error',
+            'user_requested_specialist': 'User requested a specialist'} %}
+          <p class="muted">Escalation · {{ reasons.get(message.analysis.escalation_reason, 'Specialist review') }}</p>
+          {% if message.analysis.knowledge_answer %}
+          <details>
+            <summary>Previous Gemini answer</summary>
+            <p class="message-body">{{ message.analysis.knowledge_answer }}</p>
+            <p class="muted">{{ message.analysis.sources | join(', ') }}</p>
+          </details>
+          {% endif %}
+          {% endif %}
+          {% if message.channel == 'telegram' and message.sender_type == 'user' and message.telegram_delivery_status == 'unconfirmed' %}
+          <p class="muted">Automatic reply unconfirmed</p>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ol>
+      {% else %}
+      <div class="empty-inline"><h3>No messages yet</h3><p>The conversation history is currently empty.</p></div>
+      {% endif %}
+      <form method="post" action="/ui/tickets/{{ ticket.id }}/messages" class="stack-form message-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="field">
+          <label for="reply-body">Reply to the conversation</label>
+          <textarea id="reply-body" name="body" rows="5" maxlength="20000" required>{{ body or '' }}</textarea>
+          <p class="field-hint">Your reply will be labeled as a support agent message.</p>
+        </div>
+        <div class="field">
+          <label for="reply-template">Reply template</label>
+          <select id="reply-template">
+            <option value="">Choose a template</option>
+            <option value="Please send the exact error text and the time it occurred.">Ask for the error</option>
+            <option value="Please describe the steps you took before the issue appeared.">Ask for steps</option>
+            <option value="Please try again and let us know whether the issue is resolved.">Confirm resolution</option>
+          </select>
+        </div>
+        <script src="{{ url_for('panel-static', path='reply-template.js') }}" defer></script>
+        <button class="button button-primary" type="submit">Send reply</button>
+      </form>
+    </section>
+  </div>
+
+  <aside class="detail-sidebar">
+    <section class="panel-card ticket-facts" aria-labelledby="ticket-details-title">
+      <h2 id="ticket-details-title">Ticket details</h2>
+      <dl class="facts-list">
+        <div><dt>Status</dt><dd>{{ ticket.status|replace('_', ' ')|title }}</dd></div>
+        <div><dt>Priority</dt><dd>{{ ticket.priority|title }}</dd></div>
+        <div><dt>Category</dt><dd>{{ ticket.category|title }} / {{ ticket.subcategory|title }}</dd></div>
+      </dl>
+      <p>Assigned to <strong>{{ ticket.assigned_agent or 'Unassigned' }}</strong></p>
+      {% if agent and not ticket.assigned_agent and ticket.status not in ('resolved', 'closed') %}
+      <form method="post" action="/ui/tickets/{{ ticket.id }}/claim">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="button button-secondary" type="submit">Take ticket</button>
+      </form>
+      {% endif %}
+      <div class="description-block">
+        <h3>Original request</h3>
+        <p>{{ ticket.description }}</p>
+      </div>
+      {% if ticket.resolution %}
+      <div class="description-block">
+        <h3>Resolution</h3>
+        <p>{{ ticket.resolution }}</p>
+      </div>
+      {% endif %}
+    </section>
+
+    <section class="panel-card update-card" aria-labelledby="update-ticket-title">
+      <h2 id="update-ticket-title">Update ticket</h2>
+      <form method="post" action="/ui/tickets/{{ ticket.id }}/update" class="stack-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="field">
+          <label for="ticket-status">Status</label>
+          <select id="ticket-status" name="status" required>
+            {% for value, label in [('open', 'Open'), ('in_progress', 'In progress'), ('waiting_for_user', 'Waiting for user'), ('resolved', 'Resolved'), ('closed', 'Closed')] %}
+            <option value="{{ value }}" {% if ticket.status == value %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="ticket-priority">Priority</label>
+          <select id="ticket-priority" name="priority" required>
+            {% for value in ['low', 'medium', 'high', 'critical'] %}
+            <option value="{{ value }}" {% if ticket.priority == value %}selected{% endif %}>{{ value|title }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="ticket-resolution">Resolution</label>
+          <textarea id="ticket-resolution" name="resolution" rows="5" maxlength="20000">{{ ticket.resolution or '' }}</textarea>
+          <p class="field-hint">Leave blank to clear the resolution.</p>
+        </div>
+        <button class="button button-primary button-wide" type="submit">Save changes</button>
+      </form>
+    </section>
+  </aside>
+</div>
+{% endblock %}

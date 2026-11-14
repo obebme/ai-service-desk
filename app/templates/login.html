@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+
+{% block title %}Sign in{% endblock %}
+
+{% block content %}
+<section class="login-layout" aria-labelledby="login-title">
+  <div class="login-intro">
+    <p class="eyebrow">Internal support workspace</p>
+    <h1 id="login-title">Welcome back</h1>
+    <p>Sign in with your authorized support role credentials to manage tickets.</p>
+  </div>
+  <div class="panel-card login-card">
+    {% if error %}
+    <div class="alert alert-error" role="alert">
+      <strong>Sign-in failed.</strong> {{ error }}
+    </div>
+    {% endif %}
+    <form method="post" action="/ui/login" class="stack-form" hx-boost="false">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="field">
+        <label for="role-token">Role access token</label>
+        <input id="role-token" name="role_token" type="password" required
+               autocomplete="current-password" autocapitalize="none" spellcheck="false">
+        <p class="field-hint">Credentials are checked by the server and are not saved in this browser.</p>
+      </div>
+      <button class="button button-primary button-wide" type="submit">Sign in</button>
+    </form>
+  </div>
+</section>
+{% endblock %}
