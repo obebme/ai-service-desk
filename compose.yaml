@@ -17,7 +17,8 @@ services:
     build: .
     env_file: [.env]
     environment:
-      DATABASE_URL: postgresql+psycopg://servicedesk:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/servicedesk
+      DATABASE_URL: postgresql+psycopg://servicedesk@db:5432/servicedesk
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     command: ["alembic", "upgrade", "head"]
     depends_on:
       db: {condition: service_healthy}
@@ -25,7 +26,8 @@ services:
     build: .
     env_file: [.env]
     environment:
-      DATABASE_URL: postgresql+psycopg://servicedesk:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/servicedesk
+      DATABASE_URL: postgresql+psycopg://servicedesk@db:5432/servicedesk
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       N8N_WEBHOOK_URL: ${N8N_WEBHOOK_URL:-}
     ports: ["127.0.0.1:8000:8000"]
     restart: unless-stopped
