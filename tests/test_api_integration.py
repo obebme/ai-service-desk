@@ -454,6 +454,95 @@ def test_concurrent_process_message_runs_ai_once_and_reuses_saved_result(
     )) == 1
 
 
+@pytest.mark.parametrize("failure", ["connect", "http", "timeout_after_processing", "timeout_during_processing"])
+def test_n8n_failure_falls_back_without_duplicate_ticket_or_reply(api_context, monkeypatch, failure):
+    request, db = api_context
+    sessions = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+    monkeypatch.setattr(main, "SessionLocal", sessions)
+    monkeypatch.setattr(main.settings, "telegram_webhook_secret", "telegram-test-secret")
+    monkeypatch.setattr(main.settings, "telegram_token", "telegram-test-token")
+    monkeypatch.setattr(main.settings, "workflow_token", "workflow-test-secret")
+    monkeypatch.setattr(main.settings, "n8n_webhook_url", "http://n8n.test/webhook/incoming")
+
+    def request_session():
+        with sessions() as session:
+            yield session
+
+    monkeypatch.setitem(main.app.dependency_overrides, get_db, request_session)
+    payload = {"message": {"message_id": 1234, "from": {"id": 706},
+                           "chat": {"id": 706, "type": "private"}, "text": "VPN needs manual review"}}
+    queued = _telegram_request(request, payload)
+    assert queued.status_code == 200 and queued.json()["queued"]
+    message_id, claim_until = main._claim_telegram_message()
+    classifications = []
+    deliveries = []
+    real_client = httpx.AsyncClient
+
+    async def scenario():
+        ai_started = asyncio.Event()
+        release_ai = asyncio.Event()
+        workflow_task = None
+        process_message = main.process_message
+        headers = {"X-Workflow-Token": "workflow-test-secret"}
+        async with real_client(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as api:
+            async def workflow():
+                response = await api.post("/api/v1/internal/process-message", headers=headers,
+                                          json={"message_id": str(message_id)})
+                response.raise_for_status()
+                return response.json()["reply"]
+
+            async def analyze(body):
+                classifications.append(body)
+                ai_started.set()
+                if failure == "timeout_during_processing":
+                    await asyncio.wait_for(release_ai.wait(), 3)
+                return Analysis(summary=body, needs_human=True, confidence=0.95, suggested_action="review")
+
+            async def send(chat_id, reply):
+                deliveries.append((chat_id, reply))
+
+            async def process(session, message):
+                if ai_started.is_set():
+                    release_ai.set()
+                return await process_message(session, message)
+
+            async def n8n(request):
+                nonlocal workflow_task
+                if failure == "connect":
+                    raise httpx.ConnectError("unavailable", request=request)
+                if failure == "http":
+                    return httpx.Response(502)
+                if failure == "timeout_after_processing":
+                    await workflow()
+                else:
+                    workflow_task = asyncio.create_task(workflow())
+                    await asyncio.wait_for(ai_started.wait(), 3)
+                raise httpx.ReadTimeout("no response", request=request)
+
+            monkeypatch.setattr(main, "analyze", analyze)
+            monkeypatch.setattr(main, "send_telegram_message", send)
+            monkeypatch.setattr(main, "process_message", process)
+            monkeypatch.setattr(main.httpx, "AsyncClient", lambda **kwargs: real_client(
+                transport=httpx.MockTransport(n8n), **kwargs))
+            try:
+                await asyncio.wait_for(main._dispatch_telegram_message(message_id), 5)
+            finally:
+                release_ai.set()
+                if workflow_task is not None:
+                    await asyncio.wait_for(workflow_task, 5)
+            assert await workflow() == deliveries[0][1]
+
+    asyncio.run(scenario())
+    main._finish_telegram_attempt(message_id, claim_until, True)
+    ticket = db.scalars(select(Ticket)).one()
+    message = db.scalars(select(Message)).one()
+    assert len(classifications) == len(deliveries) == 1
+    assert deliveries[0][0] == "706" and ticket.ticket_number in deliveries[0][1]
+    assert message.ticket_id == ticket.id
+    assert message.telegram_delivery_status == "accepted"
+    assert message.processing_due_at is None
+
+
 def test_failed_background_attempt_keeps_message_for_retry(api_context, monkeypatch):
     request, db = api_context
     monkeypatch.setattr(main.settings, "telegram_webhook_secret", "telegram-test-secret")

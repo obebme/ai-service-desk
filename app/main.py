@@ -1272,17 +1272,23 @@ def _finish_telegram_attempt(message_id, claim_until, succeeded):
 
 async def _dispatch_telegram_message(message_id):
     if settings.n8n_webhook_url:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(210, connect=5)) as client:
-            response = await client.post(
-                settings.n8n_webhook_url, json={"message_id": str(message_id)},
-                headers={"X-Workflow-Token": settings.n8n_ingress_token},
-            )
-            response.raise_for_status()
-    else:
-        with SessionLocal() as db:
-            msg = await run_in_threadpool(db.get, Message, message_id)
-            if msg is not None:
-                await process_message(db, msg)
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(210, connect=5)) as client:
+                response = await client.post(
+                    settings.n8n_webhook_url, json={"message_id": str(message_id)},
+                    headers={"X-Workflow-Token": settings.n8n_ingress_token},
+                )
+                response.raise_for_status()
+            return
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            logger.warning("telegram_n8n_fallback message_id=%s error_type=%s",
+                           message_id, type(exc).__name__)
+
+    # A timed-out workflow may still be processing this row. Use the same lock and saved result.
+    with SessionLocal() as db:
+        msg = await run_in_threadpool(db.get, Message, message_id)
+        if msg is not None:
+            await process_message(db, msg)
 
 
 async def _telegram_processing_worker():

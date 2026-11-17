@@ -13,7 +13,7 @@ The MVP includes the Agent/Admin panel, personal ticket claiming, and Telegram n
 - **PostgreSQL with pgvector** stores users, departments, tickets, messages, audit events, knowledge documents/chunks, and embeddings.
 - **Gemini API** classifies requests, generates grounded answers, and creates query/document embeddings.
 - **Telegram Bot API** delivers incoming user messages and outgoing replies.
-- **n8n** is an optional Telegram processing trigger. When configured, it calls the authenticated internal processing endpoint; otherwise FastAPI processes the message directly.
+- **n8n** is an optional Telegram processing trigger. It calls the authenticated internal processing endpoint. FastAPI processes the same message directly if n8n is unconfigured or the workflow request fails.
 - **Docker Compose** runs PostgreSQL, migrations, API, and optional n8n. Alembic is the only schema migration mechanism.
 
 ### Request flows
@@ -142,7 +142,7 @@ Revision `0005_telegram_processing` adds the processing schedule. Revision `0006
 
 - User API bearer tokens are bound to individual Telegram IDs via USER_API_TOKENS. The requested X-Telegram-User-ID must match the token binding.
 - Telegram webhook and n8n internal processing use separate shared secrets; missing secrets fail closed.
-- The webhook commits the incoming message and its processing schedule before acknowledging it. The background worker retries failed n8n calls.
+- The webhook commits the incoming message and its processing schedule before acknowledging it. After an n8n request fails, the worker tries direct processing and reschedules the message if that attempt fails.
 - Compose publishes the API on loopback. The documented local Telegram demo uses a loopback webhook proxy and an operator-configured HTTPS tunnel.
 - Panel deployment must remain behind HTTPS and a trusted-network allowlist at ingress/firewall. Compose does not configure or enforce this panel ingress boundary.
 - Panel HTML responses are `no-store`. Upload routes require a bounded `Content-Length` and reject multipart request bodies above the 10 MB file limit plus bounded form overhead before parsing/spooling.
