@@ -1,0 +1,29 @@
+name: External staging webhook
+
+on:
+  schedule:
+    - cron: '4,14,24,34,44,54 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    env:
+      WEBHOOK_URL: ${{ secrets.STAGING_WEBHOOK_URL }}
+    steps:
+      - name: Check staging Telegram webhook
+        if: env.WEBHOOK_URL != ''
+        run: |
+          status=$(curl --proto '=https' --silent --connect-timeout 5 --max-time 15 \
+            --output /dev/null --write-out '%{http_code}' \
+            --header 'Content-Type: application/json' --data '{}' -- "$WEBHOOK_URL") || {
+              echo '::error::Staging webhook is unreachable'
+              exit 1
+          }
+          if [ "$status" != 401 ]; then
+            echo "::error::Staging webhook returned HTTP $status (expected 401)"
+            exit 1
+          fi

@@ -75,6 +75,8 @@
           {% endif %}
           {% if message.channel == 'telegram' and message.sender_type == 'user' and message.telegram_delivery_status == 'unconfirmed' %}
           <p class="muted">Automatic reply unconfirmed</p>
+          {% elif message.sender_type == 'agent' and message.telegram_delivery_status in ['unconfirmed', 'pending'] %}
+          <p class="muted">Agent reply delivery unconfirmed. Verify receipt before sending again.</p>
           {% endif %}
         </li>
         {% endfor %}

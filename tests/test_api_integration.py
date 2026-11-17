@@ -100,6 +100,33 @@ def test_user_cannot_read_another_users_ticket(api_context):
     assert response.status_code == 404
 
 
+def test_ticket_update_reloads_status_changed_by_another_session(api_context):
+    request, db = api_context
+    owner = User(display_name="Status update test")
+    db.add(owner)
+    db.flush()
+    ticket = Ticket(ticket_number="SD-STATUS-RACE", requester_id=owner.id,
+                    subject="Status update", description="Test", status="closed",
+                    closed_at=datetime.now(timezone.utc) - timedelta(days=1))
+    db.add(ticket)
+    db.commit()
+    ticket_id = ticket.id
+    previous_close = ticket.closed_at
+    with Session(db.get_bind()) as other:
+        reopened = other.get(Ticket, ticket_id)
+        reopened.status = "open"
+        reopened.closed_at = None
+        other.commit()
+
+    response = request("PATCH", f"/api/v1/tickets/{ticket_id}",
+                       headers={"Authorization": "Bearer agent-test"}, json={"status": "closed"})
+    assert response.status_code == 200
+    with Session(db.get_bind()) as other:
+        reclosed = other.get(Ticket, ticket_id)
+        assert reclosed.status == "closed"
+        assert reclosed.closed_at > previous_close
+
+
 def test_user_cannot_change_ticket_status(api_context):
     request, db = api_context
     owner = User(telegram_user_id="status-owner", display_name="owner")

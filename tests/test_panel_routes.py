@@ -65,7 +65,7 @@ class _DB:
             return _Scalars(self.documents)
         return _Scalars([])
 
-    def get(self, model, key):
+    def get(self, model, key, **_options):
         if model is Ticket:
             return next((row for row in self.tickets if row.id == key), None)
         return None
@@ -254,9 +254,12 @@ def test_ticket_detail_separates_saved_message_from_unconfirmed_delivery(monkeyp
     async def exercise():
         client, _csrf = _client(monkeypatch, _DB([ticket], messages=[saved]))
         async with client:
+            history = await client.get(f"/ui/tickets/{ticket.id}")
             response = await client.get(
                 f"/ui/tickets/{ticket.id}?message_id={saved.id}"
             )
+        assert history.status_code == 200
+        assert "Agent reply delivery unconfirmed" in history.text
         assert response.status_code == 200
         assert "Message saved." in response.text
         assert "Unconfirmed — Telegram delivery was not confirmed." in response.text

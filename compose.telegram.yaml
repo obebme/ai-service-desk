@@ -26,6 +26,7 @@ services:
     build: .
     command: ["python", "-m", "scripts.monitor_telegram"]
     environment:
+      N8N_WEBHOOK_URL: ${N8N_WEBHOOK_URL:-}
       DATABASE_URL: postgresql+psycopg://servicedesk@db:5432/servicedesk
       PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:?Set TELEGRAM_TOKEN in .env}

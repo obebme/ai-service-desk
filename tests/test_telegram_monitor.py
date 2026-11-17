@@ -29,6 +29,27 @@ def test_queue_thresholds_include_count_and_oldest_age():
     assert monitor.queue_problem(1, 120, 10, 120) == "queue: 1 pending; oldest 120s"
 
 
+def test_n8n_check_detects_disconnected_or_unregistered_workflow():
+    url = "http://n8n:5678/webhook/service-desk-incoming"
+
+    def probe(status):
+        def respond(request):
+            assert request.method == "POST"
+            assert "x-workflow-token" not in request.headers
+            if status is None:
+                raise httpx.ConnectError("unavailable", request=request)
+            return httpx.Response(status)
+
+        with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+            assert monitor.check_n8n(client, "") is None
+            return monitor.check_n8n(client, url)
+
+    assert probe(401) is None
+    assert probe(403) is None
+    assert probe(404) == "n8n webhook HTTP 404; FastAPI fallback available"
+    assert probe(None) == "n8n webhook unreachable; FastAPI fallback available"
+
+
 def test_alert_retries_errors_and_sends_recovery_once(monkeypatch):
     outgoing = []
 

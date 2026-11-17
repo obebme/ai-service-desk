@@ -39,6 +39,19 @@ def queue_problem(count, age, count_limit, age_limit):
     return None
 
 
+def check_n8n(client, url):
+    if not url:
+        return None
+    try:
+        # The registered workflow rejects unauthenticated requests before executing.
+        response = client.post(url, json={})
+    except (httpx.HTTPError, httpx.InvalidURL):
+        return "n8n webhook unreachable; FastAPI fallback available"
+    if response.status_code not in {401, 403}:
+        return f"n8n webhook HTTP {response.status_code}; FastAPI fallback available"
+    return None
+
+
 def check_queue(count_limit, age_limit):
     try:
         with engine.connect() as connection:
@@ -91,6 +104,7 @@ def main():
             checks = {
                 "webhook": check_webhook(client, bot, webhook),
                 "queue": check_queue(count_limit, age_limit),
+                "n8n": check_n8n(client, settings.n8n_webhook_url),
             }
             problems = {key: problem for key, problem in checks.items() if problem}
             previous = notify(client, bot, chat_id, previous, problems)

@@ -302,7 +302,10 @@ def _validate_panel_csrf(form: dict[str, str | UploadFile], payload: dict) -> No
         raise HTTPException(400, "Invalid CSRF token")
 
 
-def _record_ticket_update(db: Session, ticket: Ticket, data: TicketPatch) -> Ticket:
+def _record_ticket_update(db: Session, ticket_id: uuid.UUID, data: TicketPatch) -> Ticket:
+    ticket = db.get(Ticket, ticket_id, with_for_update=True, populate_existing=True)
+    if ticket is None:
+        raise HTTPException(404, "Ticket not found")
     changes = data.model_dump(exclude_unset=True)
     old_status = ticket.status
     for key, value in changes.items():
@@ -657,10 +660,7 @@ def ticket_detail(ticket_id: uuid.UUID, role: str = Depends(require("user", "age
 @app.patch("/api/v1/tickets/{ticket_id}", response_model=TicketView)
 def update_ticket(ticket_id: uuid.UUID, data: TicketPatch, role: str = Depends(require("agent", "admin")),
                   db: Session = Depends(get_db)):
-    ticket = db.get(Ticket, ticket_id)
-    if ticket is None:
-        raise HTTPException(404, "Ticket not found")
-    return _record_ticket_update(db, ticket, data)
+    return _record_ticket_update(db, ticket_id, data)
 
 
 @app.get("/api/v1/tickets/{ticket_id}/messages", response_model=list[MessageView])
@@ -970,9 +970,6 @@ async def panel_update_ticket(ticket_id: uuid.UUID, request: Request,
         request, {"csrf_token"}, {"csrf_token", "status", "priority", "resolution"}
     )
     _validate_panel_csrf(form, payload)
-    ticket = db.get(Ticket, ticket_id)
-    if ticket is None:
-        raise HTTPException(404, "Ticket not found")
     patch_data = {
         key: (None if key == "resolution" and value == "" else value)
         for key, value in form.items() if key != "csrf_token"
@@ -981,8 +978,8 @@ async def panel_update_ticket(ticket_id: uuid.UUID, request: Request,
         data = TicketPatch.model_validate(patch_data)
     except ValidationError as exc:
         raise RequestValidationError(exc.errors()) from exc
-    _record_ticket_update(db, ticket, data)
-    return RedirectResponse(f"/ui/tickets/{ticket.id}", status_code=303)
+    await run_in_threadpool(_record_ticket_update, db, ticket_id, data)
+    return RedirectResponse(f"/ui/tickets/{ticket_id}", status_code=303)
 
 
 @app.get("/ui/knowledge", response_class=HTMLResponse)
