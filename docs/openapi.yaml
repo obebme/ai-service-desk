@@ -42,9 +42,9 @@ paths:
       tags: [Panel]
       operationId: panelLogin
       description: >
-        Validates an existing Agent/Admin role Bearer token on the server. Never log
-        or return the submitted token. On success, sets a signed 8-hour session cookie
-        containing role, CSRF token, and expiry only; the Bearer token is not stored.
+        Accepts an Agent/Admin role token or a personal panel agent token. On success,
+        sets a signed 8-hour session cookie with role, CSRF token, expiry, and the
+        agent name for a personal login.
       requestBody:
         required: true
         content:
@@ -113,9 +113,8 @@ paths:
       security:
         - sessionCookie: []
       description: >
-        Agent/Admin queue. Status filtering uses the existing API; q is searched
-        only against the returned latest set of at most 100 records, not the full
-        database. The result count and search limitation must be visible in the UI.
+        Agent/Admin queue. The database applies search and filters before pagination.
+        Each page shows up to 25 tickets.
       parameters:
         - name: status
           in: query
@@ -126,11 +125,27 @@ paths:
         - name: q
           in: query
           required: false
-          description: Local search in ticket number, subject, and description only.
+          description: Case-insensitive search by ticket number, subject, or description.
           schema:
             type: string
             maxLength: 200
+        - name: page
+          in: query
+          description: Page number. Values above the last page show the last page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 999999999
+            default: 1
+        - name: attention
+          in: query
+          description: Queue filter. The mine filter requires a personal agent session.
+          schema:
+            type: string
+            enum: [reply, delivery, mine, unassigned]
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Rendered queue page.
           content:
@@ -162,16 +177,76 @@ paths:
           description: Ticket not found.
         "422":
           $ref: "#/components/responses/ValidationError"
+  /ui/tickets/{ticket_id}/photos/{message_id}:
+    get:
+      tags: [Panel]
+      operationId: panelTicketPhoto
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/TicketId"
+        - name: message_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Telegram screenshot attached to the ticket.
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+        "303":
+          description: Missing or expired session; redirect to /ui/login.
+        "404":
+          description: No accessible photo for this ticket and message, or Telegram is not configured.
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          description: Telegram could not supply a valid JPEG within the size limit.
+  /ui/tickets/{ticket_id}/claim:
+    post:
+      tags: [Panel]
+      operationId: panelClaimTicket
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/TicketId"
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [csrf_token]
+              properties:
+                csrf_token:
+                  type: string
+      responses:
+        "303":
+          description: Ticket assigned; redirect to ticket detail. Missing or expired sessions redirect to /ui/login.
+        "400":
+          description: Invalid form or CSRF token.
+        "403":
+          description: A configured personal agent session is required.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Ticket is assigned to another agent or is resolved or closed.
+        "422":
+          $ref: "#/components/responses/ValidationError"
   /ui/tickets/{ticket_id}/messages:
     post:
       tags: [Panel]
       operationId: panelAddTicketMessage
       description: >
-        Save a panel reply and redirect to the ticket detail page. Approved behavior,
-        implementation pending: for eligible Telegram private-chat tickets, replies
-        up to 4,000 characters are saved before one sendMessage attempt to the stored
-        webhook-derived chat ID. The redirect shows save and delivery results separately.
-        No new public JSON endpoint or request field is added.
+        Save a panel reply and redirect to the ticket detail page. For eligible Telegram
+        private-chat tickets with a configured bot, the server attempts one delivery
+        to the stored chat ID after saving. The panel shows save and delivery results separately.
       security:
         - sessionCookie: []
       parameters:
@@ -210,11 +285,6 @@ paths:
           description: Ticket not found.
         "422":
           $ref: "#/components/responses/ValidationError"
-        "503":
-          description: >
-            Backend unavailable before message persistence. Telegram delivery failure
-            after the reply is saved is shown on redirect and is not reported as a
-            failed message submission.
   /ui/tickets/{ticket_id}/update:
     post:
       tags: [Panel]
@@ -331,6 +401,8 @@ paths:
       responses:
         "200":
           description: Database is reachable.
+        "503":
+          description: Database unavailable.
   /api/v1/tickets:
     post:
       tags: [Tickets]
@@ -604,7 +676,7 @@ paths:
               additionalProperties: true
       responses:
         "200":
-          description: Update durably queued, recognized as a duplicate, or ignored if non-text.
+          description: Supported message, photo, or button callback queued or recognized as a duplicate. Unsupported updates are acknowledged and ignored.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -656,7 +728,6 @@ components:
       description: Required for the User role and must match the identity bound to the Bearer token.
       schema:
         type: string
-        maxLength: 80
     TicketId:
       name: ticket_id
       in: path
@@ -678,7 +749,6 @@ components:
   schemas:
     TicketCreate:
       type: object
-      additionalProperties: false
       required: [subject, description]
       properties:
         subject:
@@ -691,9 +761,11 @@ components:
           maxLength: 20000
         category:
           type: string
+          maxLength: 60
           default: other
         subcategory:
           type: string
+          maxLength: 80
           default: other
         priority:
           type: string
@@ -759,7 +831,6 @@ components:
           format: date-time
     MessageCreate:
       type: object
-      additionalProperties: false
       required: [body]
       properties:
         body:

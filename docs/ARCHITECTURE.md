@@ -2,7 +2,7 @@
 
 ## Status
 
-The MVP, Agent/Admin panel baseline, and Telegram reply notification behavior are approved. The application persists Telegram delivery outcomes. Deployment remains restricted to HTTPS and a trusted-network ingress.
+The MVP includes the Agent/Admin panel, personal ticket claiming, and Telegram notifications for panel replies. The application persists Telegram delivery outcomes. Deployment remains restricted to HTTPS and a trusted-network ingress.
 
 ## Architecture
 
@@ -20,9 +20,9 @@ The MVP, Agent/Admin panel baseline, and Telegram reply notification behavior ar
 
 **Telegram:** Telegram HTTPS webhook -> secret validation and request validation -> persist incoming message under a unique `(channel, external_message_id)` -> optional n8n trigger or direct FastAPI processing -> Gemini classification -> pgvector retrieval -> grounded response or ticket escalation -> persist outcome -> send Telegram reply.
 
-**Agent API:** Bearer role token -> FastAPI role check -> ticket/knowledge/analytics service -> PostgreSQL. User operations additionally scope ticket access to the supplied Telegram user ID; this ID is not independently verified and therefore is not an identity proof.
+**Agent API:** Bearer role token -> FastAPI role check -> ticket/knowledge/analytics service -> PostgreSQL. User operations require a personal bearer token bound to the supplied Telegram user ID in `USER_API_TOKENS` and scope ticket access to that user.
 
-**Agent/Admin panel:** `GET /ui/login` issues a short-lived signed pre-auth CSRF challenge -> HTTPS login form submits the challenge and existing role token -> server validates and discards the role token -> signed session cookie containing only role, CSRF token, and expiry -> server-rendered UI routes -> shared ticket/message/knowledge behavior. Require `HttpOnly`, `Secure`, `SameSite=Lax`, an 8-hour expiry, a mandatory `SESSION_SIGNING_SECRET` with no fallback, and CSRF validation on every state-changing UI form, including login and logout. Logout clears the cookie; rotating the signing secret invalidates all sessions. The stateless design cannot revoke an individual session before expiry. The browser never receives or persists the role token.
+**Agent/Admin panel:** `GET /ui/login` issues a short-lived signed pre-auth CSRF challenge -> HTTPS login form submits the challenge and a role or personal agent token -> server validates and discards the role token -> signed session cookie containing role, CSRF token, expiry, and the agent name for a personal login -> server-rendered UI routes -> shared ticket/message/knowledge behavior. Require `HttpOnly`, `Secure`, `SameSite=Lax`, an 8-hour expiry, a mandatory `SESSION_SIGNING_SECRET` with no fallback, and CSRF validation on every state-changing UI form, including login and logout. Logout clears the cookie; rotating the signing secret invalidates all sessions. Removing a personal agent from configuration invalidates sessions for that agent. A shared-role session is valid until expiration or a signing-key rotation. The browser never receives or persists the role token.
 
 **Panel reply notification:** after a panel reply is persisted, locate the private Telegram chat ID from an inbound Telegram `Message` linked to the ticket -> if the ticket is eligible and `TELEGRAM_TOKEN` is configured, call `sendMessage` once with the complete plain-text reply -> persist the delivery outcome -> redirect and show saved and delivery status separately. The client cannot supply or override the recipient.
 
@@ -30,15 +30,15 @@ The MVP, Agent/Admin panel baseline, and Telegram reply notification behavior ar
 
 ### Telegram requester notification after a panel reply
 
-**Status:** approved behavior; implementation pending.
+Implemented by the panel reply handler and Alembic revision `0004_telegram_reply_notification`.
 
 Agent/Admin submits the existing panel reply form -> persist the agent message -> if the ticket is eligible and `TELEGRAM_TOKEN` is configured, call Telegram `sendMessage` once with the persisted reply text -> record the delivery outcome -> redirect to the ticket and show save and delivery results separately. Never let a Telegram failure imply that a persisted reply was lost, and do not report delivery unless Bot API returns `ok=true`. Do not automatically retry after timeout or ambiguous results.
 
-**Approved ERD delta, pending migration:**
+**Persisted fields**
 
 - Add nullable `MESSAGES.telegram_chat_id` to persist `message.chat.id` only for an inbound Telegram private-chat update. The source message's `ticket_id` associates the address with its ticket; no recipient column is needed on `TICKETS`. Group and other chat types remain ineligible.
 - Add nullable `MESSAGES.telegram_delivery_status` and `telegram_delivery_updated_at` for Agent/Admin panel replies. Use `pending`, `accepted`, `not_configured`, `not_applicable`, and `unconfirmed`. `accepted` means Telegram Bot API returned `ok=true`, not that the user read the message.
-- Add these fields using an additive Alembic migration. Existing messages remain null; do not backfill `telegram_chat_id` from `telegram_user_id`. Retention deletes the address together with its message/ticket.
+- Existing messages keep null values unless they already have a stored private-chat address. Retention deletes the address with its message.
 - Keep delivery status and chat IDs out of public REST schemas; they are internal panel/integration data.
 
 **Approved side-effect and failure semantics:**
@@ -91,6 +91,7 @@ erDiagram
         datetime created_at
         datetime updated_at
         datetime closed_at
+        string assigned_agent
     }
     MESSAGES {
         uuid id PK
@@ -101,6 +102,10 @@ erDiagram
         string sender_type
         text body
         json analysis
+        string telegram_chat_id
+        string telegram_delivery_status
+        datetime telegram_delivery_updated_at
+        datetime processing_due_at
         datetime created_at
     }
     KNOWLEDGE_DOCUMENTS {
@@ -131,15 +136,14 @@ erDiagram
 
 `closed_at` is implemented in the current model and by Alembic revision `0003_ticket_closed_at`. The panel's stateless signed cookie does not require a session table or database migration. The audit entity reference remains polymorphic, as in the current schema; shared role tokens do not provide individual staff attribution.
 
-The approved notification ERD delta is not implemented yet: an additive migration must add nullable `messages.telegram_chat_id`, `messages.telegram_delivery_status`, and `messages.telegram_delivery_updated_at`. The inbound message with the chat ID is linked to its ticket; no address is backfilled for existing messages.
+Revision `0005_telegram_processing` adds the processing schedule. Revision `0006_ticket_assignee` adds the assigned agent. The panel queries the database directly for search and filtering and displays 25 tickets per page. The REST ticket list returns up to 100 results.
 
 ### Security and operational boundaries
 
-- The three static Bearer tokens map to User, Agent, and Admin. Secrets are supplied through environment configuration and must not be logged.
 - User API bearer tokens are bound to individual Telegram IDs via USER_API_TOKENS. The requested X-Telegram-User-ID must match the token binding.
 - Telegram webhook and n8n internal processing use separate shared secrets; missing secrets fail closed.
 - The webhook commits the incoming message and its processing schedule before acknowledging it. The background worker retries failed n8n calls.
-- The Compose API binding is localhost-only. Receiving Telegram webhooks requires an operator-provided public HTTPS ingress/reverse proxy; this repo does not yet configure one.
+- Compose publishes the API on loopback. The documented local Telegram demo uses a loopback webhook proxy and an operator-configured HTTPS tunnel.
 - Panel deployment must remain behind HTTPS and a trusted-network allowlist at ingress/firewall. Compose does not configure or enforce this panel ingress boundary.
 - Panel HTML responses are `no-store`. Upload routes require a bounded `Content-Length` and reject multipart request bodies above the 10 MB file limit plus bounded form overhead before parsing/spooling.
 - Shared Agent/Admin tokens authorize by role only; they do not establish an individual employee identity. Do not record a staff identity in audit events unless a separate verified identity mechanism is approved.
@@ -162,9 +166,9 @@ Implement a daily idempotent cleanup command, invoked by the deployment's schedu
 
 The host/operator must configure and monitor the daily schedule. Cleanup must support a dry-run mode for initial verification and must never delete open tickets.
 
-## Implementation plan
+## Original implementation plan
 
-Steps 1–6 describe the already implemented MVP baseline and are retained for context. The panel work is step 7; production changes for it start only after the user explicitly approves this architecture and `openapi.yaml`.
+These milestones record the original acceptance criteria. The sections above describe the current implementation.
 
 1. **API contracts and schemas**
    - Add strict request validation for ticket updates (reject unknown fields, empty patches, and invalid nulls).
@@ -200,13 +204,13 @@ Steps 1–6 describe the already implemented MVP baseline and are retained for c
    - Acceptance: report exact commands/results; tests requiring live Gemini/Telegram/n8n must be clearly separated from mocked tests.
 
 7. **Agent/Admin panel (approved)**
-   - Add Jinja2 and same-origin server-rendered UI routes for login/logout, ticket queue/detail/message/update, and Admin-only knowledge list/upload. Serve a pinned local HTMX asset (no CDN). Keep queue search limited to the latest 100 API results; do not introduce new search, pagination, assignment, or SLA APIs.
+   - Add Jinja2 and same-origin server-rendered UI routes for login/logout, ticket queue/detail/message/update, and Admin-only knowledge list/upload. Serve a pinned local HTMX asset (no CDN). Keep the public REST list bounded. The panel adds database-backed search, pagination, filters, and personal ticket claiming.
    - Add required `SESSION_SIGNING_SECRET` configuration without a fallback; validate role tokens only on the server and issue a signed 8-hour cookie containing no Bearer token. Configure `HttpOnly`, `Secure`, and `SameSite=Lax`; require synchronizer CSRF tokens on all state-changing forms. Enforce HTTPS and trusted-network access at ingress.
    - Reuse existing validation and business behavior. Do not expose API tokens in HTML, JavaScript, URLs, browser storage, or logs. Enforce Admin-only document operations on the server.
    - Add focused tests for login role mapping, cookie flags/expiry/logout, invalid credentials, CSRF rejection, Agent/Admin permissions, ticket/message flows, upload body/file limits and errors, and backend unavailability; update README/operator guidance.
-   - Acceptance: the browser has no API token; invalid role/CSRF requests cannot mutate data; Agent cannot use knowledge-management UI routes; Admin can list/upload within existing limits; queue search clearly reports the 100-result bound.
+   - Acceptance: the browser has no API token; invalid role/CSRF requests cannot mutate data; Agent cannot use knowledge-management UI routes; Admin can list/upload within existing limits; queue search applies the filters before pagination.
 
-8. **Telegram notification for panel replies (approved; implementation pending)**
+8. **Telegram notification for panel replies**
    - Add nullable `Message.telegram_chat_id`, `telegram_delivery_status`, and `telegram_delivery_updated_at` with an additive Alembic migration. Store `message.chat.id` from validated private-chat Telegram updates; existing messages remain without an address.
    - Only replies posted by Agent/Admin through the panel are eligible. Resolve the recipient from an inbound Telegram message linked to the ticket; do not use a client-supplied recipient or `telegram_user_id` fallback.
    - Reject eligible replies longer than 4,000 characters before saving. Otherwise persist first, attempt one `sendMessage` with the full plain-text body, store the outcome, and show message-save and delivery results separately. No automatic retries or outbox.
