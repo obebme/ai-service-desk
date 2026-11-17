@@ -1,10 +1,12 @@
-"""Forward only the Telegram webhook from a loopback tunnel origin."""
+"""Forward only the Telegram webhook from the tunnel origin."""
 
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 WEBHOOK_PATH = "/integrations/telegram/webhook"
+UPSTREAM = os.getenv("TELEGRAM_INGRESS_UPSTREAM", "http://127.0.0.1:8000")
 
 
 class WebhookIngress(BaseHTTPRequestHandler):
@@ -24,7 +26,7 @@ class WebhookIngress(BaseHTTPRequestHandler):
             self.send_error(413)
             return
         request = Request(
-            f"http://127.0.0.1:8000{WEBHOOK_PATH}",
+            f"{UPSTREAM}{WEBHOOK_PATH}",
             data=self.rfile.read(size),
             headers={
                 "Content-Type": "application/json",
@@ -45,5 +47,6 @@ class WebhookIngress(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    with ThreadingHTTPServer(("127.0.0.1", 18081), WebhookIngress) as server:
+    host = os.getenv("TELEGRAM_INGRESS_BIND", "127.0.0.1")
+    with ThreadingHTTPServer((host, 18081), WebhookIngress) as server:
         server.serve_forever()

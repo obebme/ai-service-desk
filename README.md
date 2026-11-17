@@ -45,7 +45,31 @@ FastAPI сохраняет входящее сообщение в PostgreSQL и 
 5. API и Swagger доступны на `http://localhost:8000` и `/docs`; панель — на `http://localhost:8000/ui/login` при локальной loopback-разработке.
 6. Для использования n8n настройте [workflow](n8n/README.md) и активируйте его перед регистрацией webhook Telegram.
 
-Для демонстрации в Telegram запустите в отдельных терминалах:
+### Telegram на тестовом стенде
+
+Остановите прежний туннель, если он уже использует тот же домен ngrok. Задайте в `.env` токен бота и секрет webhook. Создайте локальный файл `.env.telegram` с настройками:
+
+```dotenv
+NGROK_DOMAIN=your-domain.ngrok-free.dev
+NGROK_AUTHTOKEN=your-ngrok-agent-token
+TELEGRAM_ALERT_CHAT_ID=123456789
+TELEGRAM_QUEUE_ALERT_COUNT=10
+TELEGRAM_QUEUE_ALERT_AGE_SECONDS=120
+```
+
+Для приёма оповещений начните личный чат с этим ботом и укажите ID тестового чата. Запустите стек из корня репозитория:
+
+```powershell
+docker compose --env-file .env --env-file .env.telegram -f compose.yaml -f compose.telegram.yaml up -d --build
+```
+
+Для маршрута через n8n добавьте `--profile automation` перед `up` и настройте workflow по [инструкции n8n](n8n/README.md). Зарегистрируйте webhook на `https://<NGROK_DOMAIN>/integrations/telegram/webhook` через Telegram Bot API с `secret_token` со значением `TELEGRAM_WEBHOOK_SECRET` и типами обновлений `message` и `callback_query`.
+
+Docker перезапускает контейнеры ngrok, прокси и мониторинга при сбое и запуске Docker Engine, если их не остановили вручную. Прокси пересылает только POST на маршрут webhook. Монитор примерно раз в минуту сверяет адрес в Telegram, проверяет публичный маршрут и считает необработанные сообщения в PostgreSQL. Оповещение приходит при недоступности webhook, ошибке проверки БД, достижении порога очереди или восстановлении. Статус оповещений хранится в памяти процесса: после перезапуска монитор может повторно сообщить о текущем сбое. Если Bot API недоступен, события остаются в логах контейнера `telegram-monitor`, а отправка повторяется, пока сохраняется обнаруженная проблема.
+
+### Ручной запуск туннеля
+
+Для локальной демонстрации можно запустить прокси и ngrok в отдельных терминалах:
 
 ```powershell
 python scripts/telegram_ingress.py
