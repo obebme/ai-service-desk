@@ -9,14 +9,18 @@ permissions: {}
 
 jobs:
   probe:
+    if: github.event_name == 'workflow_dispatch' || vars.STAGING_WEBHOOK_MONITOR_ENABLED == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     env:
       WEBHOOK_URL: ${{ secrets.STAGING_WEBHOOK_URL }}
     steps:
       - name: Check staging Telegram webhook
-        if: env.WEBHOOK_URL != ''
         run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo '::error::Set the STAGING_WEBHOOK_URL repository secret'
+            exit 1
+          fi
           status=$(curl --proto '=https' --silent --connect-timeout 5 --max-time 15 \
             --output /dev/null --write-out '%{http_code}' \
             --header 'Content-Type: application/json' --data '{}' -- "$WEBHOOK_URL") || {
