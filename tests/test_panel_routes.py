@@ -751,3 +751,37 @@ def test_oversized_upload_body_is_rejected_before_form_parsing(monkeypatch):
         assert response.status_code == 413
 
     asyncio.run(exercise())
+
+@pytest.mark.parametrize("filename, content", [
+    ("x" * 237 + ".txt", b"text"),
+    ("runbook.txt", b"before\x00after"),
+])
+def test_upload_rejects_text_that_postgresql_cannot_store(filename, content):
+    from io import BytesIO
+    from starlette.datastructures import UploadFile
+
+    file = UploadFile(filename=filename, file=BytesIO(content))
+    with pytest.raises(main.HTTPException) as error:
+        asyncio.run(main._ingest_knowledge_document(file, _DB()))
+    assert error.value.status_code == 400
+
+
+def test_waiting_for_reply_includes_tickets_created_without_messages():
+    from sqlalchemy import create_engine, select
+
+    engine = create_engine("sqlite://")
+    with engine.begin() as connection:
+        connection.exec_driver_sql("CREATE TABLE tickets (id INTEGER, status TEXT)")
+        connection.exec_driver_sql(
+            "CREATE TABLE messages (id INTEGER, ticket_id INTEGER, sender_type TEXT, created_at TEXT)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO tickets VALUES (1, 'open'), (2, 'open'), (3, 'in_progress'), (4, 'closed')"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO messages VALUES (1, 2, 'agent', '2026-01-01'), "
+            "(2, 3, 'agent', '2026-01-01'), (3, 3, 'user', '2026-01-02')"
+        )
+        waiting = connection.scalars(select(Ticket.status).where(main._awaiting_reply())
+                                     .order_by(Ticket.id)).all()
+    assert waiting == ["open", "in_progress"]

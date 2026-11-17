@@ -705,7 +705,7 @@ def _awaiting_reply():
         select(Message.sender_type).where(Message.ticket_id == Ticket.id)
         .order_by(Message.created_at.desc(), Message.id.desc()).limit(1).scalar_subquery()
     )
-    return Ticket.status.in_(("open", "in_progress")) & (latest_sender == "user")
+    return Ticket.status.in_(("open", "in_progress")) & (func.coalesce(latest_sender, "user") == "user")
 
 
 @app.get("/ui/tickets", response_class=HTMLResponse)
@@ -1065,6 +1065,8 @@ async def ai_analyze(data: MessageCreate, role: str = Depends(require("agent", "
 
 async def _ingest_knowledge_document(file: UploadFile, db: Session) -> dict:
     name = (file.filename or "document").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if len(name) > 240 or "\x00" in name:
+        raise HTTPException(400, "Invalid document filename")
     suffix = name.lower().rsplit(".", 1)[-1] if "." in name else ""
     if suffix not in {"pdf", "txt", "md"}:
         raise HTTPException(415, "Only PDF, TXT and Markdown files are supported")
@@ -1078,6 +1080,8 @@ async def _ingest_knowledge_document(file: UploadFile, db: Session) -> dict:
         raise HTTPException(400, "Could not extract document text") from exc
     if not content.strip():
         raise HTTPException(400, "Document contains no extractable text")
+    if "\x00" in content:
+        raise HTTPException(400, "Document text contains null characters")
     doc = KnowledgeDocument(title=name, source_name=name, status="indexing")
     db.add(doc)
     db.flush()
