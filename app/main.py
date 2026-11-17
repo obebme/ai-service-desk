@@ -404,7 +404,8 @@ async def _deliver_automatic_reply(db: Session, msg: Message, reply: str) -> Non
         return
     msg.telegram_delivery_status = "accepted"
     msg.telegram_delivery_updated_at = datetime.now(timezone.utc)
-    db.commit()
+    # A concurrent processor can hold the row lock while this confirmation is saved.
+    await run_in_threadpool(db.commit)
 
 
 def _telegram_ticket_command(db: Session, msg: Message) -> str | None:

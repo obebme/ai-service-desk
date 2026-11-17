@@ -543,6 +543,47 @@ def test_n8n_failure_falls_back_without_duplicate_ticket_or_reply(api_context, m
     assert message.processing_due_at is None
 
 
+def test_delivery_confirmation_does_not_block_concurrent_reader(api_context, monkeypatch):
+    _, db = api_context
+    user = User(display_name="Delivery test")
+    db.add(user)
+    db.flush()
+    message = Message(requester_id=user.id, body="VPN unavailable", channel="telegram",
+                      telegram_chat_id="706", analysis={"reply": "Ticket created"})
+    db.add(message)
+    db.commit()
+    message_id = message.id
+    sessions = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+    monkeypatch.setattr(main.settings, "telegram_token", "telegram-test-token")
+
+    async def scenario():
+        delivery_started = asyncio.Event()
+        reader_locked = asyncio.Event()
+
+        async def send(_chat_id, _reply):
+            delivery_started.set()
+            await asyncio.wait_for(reader_locked.wait(), 3)
+
+        async def read_while_delivering():
+            await asyncio.wait_for(delivery_started.wait(), 3)
+            with sessions() as reader:
+                locked = await asyncio.to_thread(reader.get, Message, message_id, with_for_update=True)
+                assert locked.telegram_delivery_status == "unconfirmed"
+                reader_locked.set()
+                await asyncio.sleep(0.1)
+                reader.commit()
+
+        monkeypatch.setattr(main, "send_telegram_message", send)
+        with db.get_bind().connect() as connection, sessions(bind=connection) as delivery:
+            delivery.execute(text("SET lock_timeout = '1500ms'"))
+            row = delivery.get(Message, message_id)
+            await asyncio.gather(main.process_message(delivery, row), read_while_delivering())
+
+    asyncio.run(scenario())
+    db.refresh(message)
+    assert message.telegram_delivery_status == "accepted"
+
+
 def test_failed_background_attempt_keeps_message_for_retry(api_context, monkeypatch):
     request, db = api_context
     monkeypatch.setattr(main.settings, "telegram_webhook_secret", "telegram-test-secret")
