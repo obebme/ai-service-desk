@@ -192,9 +192,7 @@ def test_ai_provider_failure_returns_service_unavailable(api_context, monkeypatc
     assert "provider unavailable" not in response.text
 
 
-def test_database_unavailable_makes_readiness_fail(api_context):
-    _, _db = api_context
-
+def test_database_unavailable_makes_readiness_fail(monkeypatch):
     class BrokenDB:
         def execute(self, _statement):
             raise OperationalError("SELECT 1", {}, RuntimeError("database offline"))
@@ -202,19 +200,17 @@ def test_database_unavailable_makes_readiness_fail(api_context):
     def broken_db():
         yield BrokenDB()
 
-    previous = main.app.dependency_overrides[get_db]
-    main.app.dependency_overrides[get_db] = broken_db
-    try:
-        async def send():
-            transport = httpx.ASGITransport(app=main.app, raise_app_exceptions=False)
-            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-                return await client.get("/health/ready")
+    monkeypatch.setitem(main.app.dependency_overrides, get_db, broken_db)
 
-        response = asyncio.run(send())
-    finally:
-        main.app.dependency_overrides[get_db] = previous
-    assert response.status_code == 500
-    assert response.text == "Internal Server Error"
+    async def send():
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.get("/health/ready"), await client.get("/health/live")
+
+    readiness, liveness = asyncio.run(send())
+    assert readiness.status_code == 503
+    assert readiness.json() == {"detail": "Database unavailable"}
+    assert liveness.status_code == 200
 
 
 def _telegram_request(request, payload, *, secret="telegram-test-secret", content=None):

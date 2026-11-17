@@ -39,20 +39,44 @@ FastAPI сохраняет входящее сообщение в PostgreSQL и 
 ## Запуск
 
 1. Скопируйте `.env.example` в `.env`, замените все токены/пароли и задайте случайный `SESSION_SIGNING_SECRET` (например, `python -c "import secrets; print(secrets.token_urlsafe(32))"`). Не публикуйте `.env`.
-2. Укажите `GEMINI_API_KEY` из Google AI Studio и выберите модели через `GEMINI_MODEL` и `GEMINI_EMBEDDING_MODEL`.
-3. `docker compose --profile automation up -d --build db api n8n`
+2. Укажите `GEMINI_API_KEY` из Google AI Studio. Модели по умолчанию заданы в `.env.example`. Для смены embedding-модели при той же размерности переиндексируйте базу знаний командой `docker compose exec api python -m scripts.reembed_knowledge`. Размерность `EMBEDDING_DIMENSIONS` на существующей базе должна соответствовать колонке PostgreSQL: её изменение требует миграции схемы и переиндексации.
+3. Запустите API и PostgreSQL командой `docker compose up -d --build db api`. По умолчанию FastAPI обрабатывает обращения напрямую.
 4. Compose применит Alembic-миграции до запуска API.
 5. API и Swagger доступны на `http://localhost:8000` и `/docs`; панель — на `http://localhost:8000/ui/login` при локальной loopback-разработке.
-6. В n8n импортируйте `n8n/workflows/incoming-request.json`, назначьте две Header Auth credentials по инструкции в `n8n/README.md` и активируйте workflow. Для Telegram зарегистрируйте webhook через Bot API на публичный HTTPS URL `/integrations/telegram/webhook`, передав тот же секрет, что задан в `TELEGRAM_WEBHOOK_SECRET`.
+6. Для использования n8n настройте [workflow](n8n/README.md) и активируйте его перед регистрацией webhook Telegram.
 
-Для демонстрации в Telegram запустите в отдельных терминалах:
+### Telegram на тестовом стенде
+
+Остановите прежний туннель, если он уже использует тот же домен ngrok. Задайте в `.env` токен бота и секрет webhook. Создайте локальный файл `.env.telegram` с настройками:
+
+```dotenv
+NGROK_DOMAIN=your-domain.ngrok-free.dev
+NGROK_AUTHTOKEN=your-ngrok-agent-token
+TELEGRAM_ALERT_CHAT_ID=123456789
+TELEGRAM_QUEUE_ALERT_COUNT=10
+TELEGRAM_QUEUE_ALERT_AGE_SECONDS=120
+```
+
+Для приёма оповещений начните личный чат с этим ботом и укажите ID тестового чата. Запустите стек из корня репозитория:
+
+```powershell
+docker compose --env-file .env --env-file .env.telegram -f compose.yaml -f compose.telegram.yaml up -d --build
+```
+
+Для маршрута через n8n добавьте `--profile automation` перед `up` и настройте workflow по [инструкции n8n](n8n/README.md). Зарегистрируйте webhook на `https://<NGROK_DOMAIN>/integrations/telegram/webhook` через Telegram Bot API с `secret_token` со значением `TELEGRAM_WEBHOOK_SECRET` и типами обновлений `message` и `callback_query`.
+
+Docker перезапускает контейнеры ngrok, прокси и мониторинга при сбое и запуске Docker Engine, если их не остановили вручную. Прокси пересылает только POST на маршрут webhook. Монитор примерно раз в минуту сверяет адрес в Telegram, проверяет публичный маршрут и считает необработанные сообщения в PostgreSQL. Оповещение приходит при недоступности webhook, ошибке проверки БД, достижении порога очереди или восстановлении. Статус оповещений хранится в памяти процесса: после перезапуска монитор может повторно сообщить о текущем сбое. Если Bot API недоступен, события остаются в логах контейнера `telegram-monitor`, а отправка повторяется, пока сохраняется обнаруженная проблема.
+
+### Ручной запуск туннеля
+
+Для локальной демонстрации можно запустить прокси и ngrok в отдельных терминалах:
 
 ```powershell
 python scripts/telegram_ingress.py
 ngrok http http://127.0.0.1:18081 --inspect=false
 ```
 
-Агент ngrok должен быть подключён к вашему аккаунту. Используйте выданный HTTPS-адрес с путём `/integrations/telegram/webhook` при регистрации бота и укажите типы обновлений `message` и `callback_query`. Локальный фильтр пересылает только POST на этот путь. Панель открывается на localhost. Для запуска без n8n оставьте `N8N_WEBHOOK_URL` пустым и выполните `docker compose up -d --build db api`.
+Агент ngrok должен быть подключён к вашему аккаунту. Используйте выданный HTTPS-адрес с путём `/integrations/telegram/webhook` при регистрации бота и укажите типы обновлений `message` и `callback_query`. Локальный фильтр пересылает только POST на этот путь. Панель открывается на localhost. При регистрации передайте `secret_token` со значением `TELEGRAM_WEBHOOK_SECRET`.
 
 Схема управляется Alembic; отдельный Compose service применяет миграции до старта API. В контейнере PostgreSQL с pgvector опубликован локально на `127.0.0.1:5433`, чтобы не конфликтовать с установленным в Windows PostgreSQL на порту `5432`.
 
@@ -66,11 +90,13 @@ ngrok http http://127.0.0.1:18081 --inspect=false
 
 ## API и доступ
 
+[Контракт API и панели](docs/openapi.yaml) · [Архитектура](docs/ARCHITECTURE.md) · [Требования](docs/PRD.md)
+
 Swagger: `http://localhost:8000/docs`. Пользовательские/агентские endpoints используют Bearer-токены из `USER_API_TOKENS`, `AGENT_API_TOKEN` и `ADMIN_API_TOKEN`; исключения — health checks, Telegram webhook (Telegram secret header) и внутренний process endpoint (отдельный `WORKFLOW_TOKEN`).
 
 ### Панель Agent/Admin
 
-Откройте `/ui/login` и введите существующий `AGENT_API_TOKEN` или `ADMIN_API_TOKEN`. Сервер проверяет credential и не сохраняет его; браузер получает подписанную cookie только с ролью/CSRF/сроком действия (8 часов). Cookie имеет `HttpOnly`, `Secure`, `SameSite=Lax`; все формы, изменяющие данные, защищены CSRF. `SESSION_SIGNING_SECRET` обязателен: API не запустится без него. Для доступа через HTTP в локальной разработке используйте loopback `localhost`; при любом сетевом развертывании обязателен HTTPS и allowlist доверенной сети на ingress/firewall. Compose публикует API только на `127.0.0.1`; не выставляйте его напрямую в недоверенную сеть.
+Откройте `/ui/login` и введите `AGENT_API_TOKEN`, `ADMIN_API_TOKEN` или персональный токен из `PANEL_AGENT_TOKENS`. Подписанная cookie содержит роль, CSRF-токен, срок действия (8 часов) и имя специалиста при персональном входе. Cookie имеет `HttpOnly`, `Secure`, `SameSite=Lax`; все формы, изменяющие данные, защищены CSRF. `SESSION_SIGNING_SECRET` обязателен: API не запустится без него. Для доступа через HTTP в локальной разработке используйте loopback `localhost`; при любом сетевом развертывании обязателен HTTPS и allowlist доверенной сети на ingress/firewall. Compose публикует API только на `127.0.0.1`; не выставляйте его напрямую в недоверенную сеть.
 
 Панель ищет по номеру, теме и описанию во всей очереди. Фильтр статуса применяется до пагинации. На странице отображается до 25 тикетов. Agent/Admin могут просматривать историю, добавлять ответы и менять статус, приоритет и resolution. Только Admin может видеть и загружать документы базы знаний. Общие role-токены не дают персональной идентификации или атрибуции автора в аудите.
 
@@ -78,7 +104,7 @@ Swagger: `http://localhost:8000/docs`. Пользовательские/аген
 
 | Endpoint | Доступ/назначение |
 |---|---|
-| `GET /health/live`, `GET /health/ready` | liveness и проверка соединения с БД |
+| `GET /health/live`, `GET /health/ready` | доступность процесса и проверка соединения с БД (HTTP 503 при недоступности БД) |
 | `POST, GET /api/v1/tickets` | создание тикета; список до 100 последних тикетов, фильтр `?status=` |
 | `GET, PATCH /api/v1/tickets/{ticket_id}` | чтение тикета; изменение статуса, приоритета или resolution |
 | `GET, POST /api/v1/tickets/{ticket_id}/messages` | чтение истории и добавление сообщения |
@@ -90,13 +116,15 @@ Swagger: `http://localhost:8000/docs`. Пользовательские/аген
 | `/ui/login`, `/ui/logout` | панель Agent/Admin; формы используют защищённую сессию и CSRF |
 | `GET /ui/tickets`, `GET /ui/tickets/{ticket_id}` | очередь и история тикета |
 | `POST /ui/tickets/{ticket_id}/messages`, `/update` | ответ и изменение полей тикета |
+| `POST /ui/tickets/{ticket_id}/claim` | взять тикет в работу под персональной учётной записью |
+| `GET /ui/tickets/{ticket_id}/photos/{message_id}` | открыть прикреплённый к тикету Telegram-скриншот |
 | `GET /ui/knowledge`, `POST /ui/knowledge/upload` | список/загрузка документов, только Admin |
 
 Пользовательские операции требуют персональный Bearer-токен и соответствующий ему `X-Telegram-User-ID`; пользователь может читать/комментировать только принадлежащие этому ID тикеты. Agent/Admin имеют доступ к очереди, PATCH тикетов доступен Agent/Admin, загрузка документов — только Admin. AI analyze, список документов и аналитика доступны Agent/Admin. PATCH требует хотя бы одно известное поле; `status` и `priority` не могут быть `null`, неизвестные поля отклоняются. Разрешённые статусы: `open`, `in_progress`, `waiting_for_user`, `resolved`, `closed`.
 
 Задайте `USER_API_TOKENS='{"123456789":"<случайный-персональный-токен>"}'` в `.env`. Ключ JSON — Telegram ID пользователя, значение — его уникальный случайный ASCII-токен. Прежний общий `USER_API_TOKEN` больше не используется. При пустой карте User API отключён. Доступ Agent/Admin использует общие токены ролей и рассчитан на доверенную сеть и HTTPS.
 
-Для Telegram задайте `TELEGRAM_TOKEN` и отдельный случайный `TELEGRAM_WEBHOOK_SECRET`; зарегистрируйте webhook на публичный HTTPS URL `/integrations/telegram/webhook` с этим значением в `secret_token`. Запросы должны содержать `X-Telegram-Bot-Api-Secret-Token`. Не помещайте токен бота в код, workflow-файл или репозиторий. Malformed JSON/text updates возвращают `400`; валидные non-text updates подтверждаются и игнорируются. Текст ограничен 20 000 символами, исходящие ответы отправляются обычным текстом без parse mode и ограничены 4 000 символами. Новые сообщения дедуплицируются по ID чата и ID сообщения. Автоматический ответ отправляется в сохранённый личный чат. Перед вызовом Telegram приложение сохраняет статус unconfirmed. Подтверждение меняет статус на accepted. Повторная обработка пропускает отправку при обоих статусах. При таймауте или остановке процесса фактическая доставка может остаться неизвестной.
+Для Telegram задайте `TELEGRAM_TOKEN` и отдельный случайный `TELEGRAM_WEBHOOK_SECRET`; зарегистрируйте webhook на публичный HTTPS URL `/integrations/telegram/webhook` с этим значением в `secret_token`. Запросы должны содержать `X-Telegram-Bot-Api-Secret-Token`. Не помещайте токен бота в код, workflow-файл или репозиторий. Malformed JSON/text updates возвращают `400`; webhook также принимает кнопки обратной связи и фото с подписью `/add НОМЕР` в личном чате. Остальные неподдерживаемые обновления подтверждаются и игнорируются. Текст ограничен 20 000 символами, исходящие ответы отправляются обычным текстом без parse mode и ограничены 4 000 символами. Новые сообщения дедуплицируются по ID чата и ID сообщения. Автоматический ответ отправляется в сохранённый личный чат. Перед вызовом Telegram приложение сохраняет статус unconfirmed. Подтверждение меняет статус на accepted. Повторная обработка пропускает отправку при обоих статусах. При таймауте или остановке процесса фактическая доставка может остаться неизвестной.
 
 `N8N_WEBHOOK_URL` необязателен: если он пуст, фоновый обработчик вызывает FastAPI напрямую. При заданном URL обработчик вызывает n8n. Используйте разные случайные значения `N8N_INGRESS_TOKEN` и `WORKFLOW_TOKEN` и назначьте credentials согласно `n8n/README.md`. Webhook возвращает HTTP 200 после записи сообщения и времени обработки в PostgreSQL. При сбое фоновой обработки следующая попытка запланирована через 15 секунд. При остановке процесса незавершённая запись снова доступна через 5 минут.
 

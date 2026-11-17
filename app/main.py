@@ -603,9 +603,12 @@ def live():
     return {"status": "ok"}
 
 
-@app.get("/health/ready")
+@app.get("/health/ready", responses={503: {"description": "Database unavailable"}})
 def ready(db: Session = Depends(get_db)):
-    db.execute(text("SELECT 1"))
+    try:
+        db.execute(text("SELECT 1"))
+    except SQLAlchemyError:
+        raise HTTPException(503, "Database unavailable") from None
     return {"status": "ready"}
 
 
