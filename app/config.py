@@ -1,3 +1,4 @@
+from pydantic import PositiveInt
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -10,6 +11,7 @@ class Settings(BaseSettings):
     gemini_embedding_model: str = "gemini-embedding-001"
     telegram_token: str = ""
     telegram_webhook_secret: str = ""
+    telegram_queue_limit: PositiveInt = 100
     n8n_webhook_url: str = ""
     n8n_ingress_token: str = ""
     workflow_token: str = ""
