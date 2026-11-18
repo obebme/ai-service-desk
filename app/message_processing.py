@@ -8,7 +8,7 @@ from time import perf_counter
 
 import httpx
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, select, tuple_
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -18,7 +18,7 @@ from app.gemini import GeminiError
 from app.models import Message, Ticket
 from app.rag import search
 from app.schemas import Analysis, TicketCreate
-from app.telegram import MAIN_KEYBOARD, MENU_COMMANDS, followup_prompt, send_telegram_message
+from app.telegram import HISTORY_ENTRY, MAIN_KEYBOARD, MENU_COMMANDS, followup_prompt, send_telegram_message
 from app.telegram_limits import QUESTION_NOTICE, lock_ticket_creation, telegram_ticket_retry_after
 from app.ticket_writes import create_ticket
 
@@ -34,6 +34,73 @@ def _ticket_buttons(msg: Message, rows: list[list[tuple[str, str]]]) -> None:
     msg.analysis = {**(msg.analysis or {}), "reply_markup": {"inline_keyboard": [
         [{"text": label, "callback_data": data} for label, data in row] for row in rows
     ]}}
+
+
+def _ticket_history(db: Session, msg: Message, command: str, argument: str) -> str:
+    visible_sender = (Message.sender_type == "agent") | (
+        (Message.sender_type == "user") & (Message.requester_id == msg.requester_id)
+    )
+    part = 0
+    if command == "/history":
+        ticket = db.scalar(select(Ticket).where(
+            Ticket.requester_id == msg.requester_id, Ticket.ticket_number == argument.upper(),
+        ))
+        if ticket is None:
+            return "Обращение не найдено."
+        entry = db.scalar(select(Message).where(Message.ticket_id == ticket.id, visible_sender)
+                          .order_by(Message.created_at.desc(), Message.id.desc()).limit(1))
+    else:
+        match = HISTORY_ENTRY.fullmatch(argument)
+        if match is None:
+            return "Сообщение не найдено."
+        entry_id, part_index = match.groups()
+        part = int(part_index)
+        result = db.execute(select(Message, Ticket).join(Ticket, Message.ticket_id == Ticket.id).where(
+            Message.id == uuid.UUID(hex=entry_id), visible_sender,
+            Ticket.requester_id == msg.requester_id,
+        )).one_or_none()
+        if result is None:
+            return "Сообщение не найдено."
+        entry, ticket = result
+
+    back = [("К карточке", f"ticket:{ticket.ticket_number}")]
+    if entry is None:
+        _ticket_buttons(msg, [back])
+        return f"История {ticket.ticket_number}\nВ обращении пока нет сообщений."
+
+    body = entry.body
+    if (entry.analysis or {}).get("photo_id"):
+        body = "Скриншот" if body == "Screenshot attached" else f"Скриншот\n{body}"
+    # Leave room for the header even when every character takes two UTF-16 code units.
+    part_size = 1800
+    parts = max(1, (len(body) + part_size - 1) // part_size)
+    if part >= parts:
+        _ticket_buttons(msg, [back])
+        return "Часть сообщения не найдена."
+    rows = []
+    if parts > 1:
+        rows.append([
+            (label, f"history_entry:{entry.id.hex}:{index}")
+            for label, index in (("Предыдущая часть", part - 1), ("Следующая часть", part + 1))
+            if 0 <= index < parts
+        ])
+    entries = select(Message.id).where(Message.ticket_id == ticket.id, visible_sender)
+    position = tuple_(Message.created_at, Message.id)
+    cursor = tuple_(entry.created_at, entry.id)
+    older = db.scalar(entries.where(position < cursor)
+                      .order_by(Message.created_at.desc(), Message.id.desc()).limit(1))
+    newer = db.scalar(entries.where(position > cursor)
+                      .order_by(Message.created_at.asc(), Message.id.asc()).limit(1))
+    navigation = [(label, f"history_entry:{item.hex}:0")
+                  for label, item in (("Раньше", older), ("Позже", newer)) if item is not None]
+    if navigation:
+        rows.append(navigation)
+    _ticket_buttons(msg, [*rows, back])
+    author = "Специалист" if entry.sender_type == "agent" else "Вы"
+    number = f" · часть {part + 1}/{parts}" if parts > 1 else ""
+    date = entry.created_at.astimezone(timezone.utc)
+    excerpt = body[part * part_size:(part + 1) * part_size]
+    return f"История {ticket.ticket_number}\n{author} · {date:%d.%m.%Y %H:%M} UTC{number}\n\n{excerpt}"
 
 
 def _create_telegram_ticket(db: Session, msg: Message, data: TicketCreate) -> tuple[Ticket | None, str | None]:
@@ -140,10 +207,10 @@ def _telegram_ticket_command(db: Session, msg: Message) -> str | None:
             _ticket_buttons(msg, [back])
             return "Обращение не найдено."
         if command == "/ticket":
-            rows = [back]
+            rows = [[("История", f"history:{ticket.ticket_number}")], back]
             if ticket.status != "closed":
                 rows = [[("Добавить сообщение", f"ticket_text:{ticket.ticket_number}")],
-                        [("Прикрепить скриншот", f"ticket_photo:{ticket.ticket_number}")], back]
+                        [("Прикрепить скриншот", f"ticket_photo:{ticket.ticket_number}")], *rows]
             _ticket_buttons(msg, rows)
             status = TICKET_STATUSES.get(ticket.status, ticket.status)
             return f"{ticket.ticket_number}\n{ticket.subject}\nСтатус: {status}"
@@ -152,6 +219,8 @@ def _telegram_ticket_command(db: Session, msg: Message) -> str | None:
             return "Обращение закрыто. Отправьте новый вопрос, чтобы создать новое обращение."
         msg.analysis = {**(msg.analysis or {}), "reply_markup": {"force_reply": True}}
         return followup_prompt(command[1:], ticket.ticket_number)
+    if command in {"/history", "/history_entry"}:
+        return _ticket_history(db, msg, command, argument.strip())
     if command == "/add":
         number, _, body = argument.strip().partition(" ")
         if not number or (not body.strip() and not (msg.analysis or {}).get("photo_id")):

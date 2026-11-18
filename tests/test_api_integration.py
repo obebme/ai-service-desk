@@ -1385,12 +1385,36 @@ def test_telegram_ticket_menu_and_replies(api_context, monkeypatch):
     assert menu.ticket_id is None and ticket.ticket_number in listing
     ticket.status = "closed"
     db.commit()
+    agent = User(display_name="Support agent")
+    db.add(agent)
+    db.flush()
+    db.add(Message(ticket_id=ticket.id, requester_id=agent.id, sender_type="agent",
+                   body="Ответ специалиста\n" + "x" * 1900 + "\nКонец ответа"))
+    db.add(Message(ticket_id=ticket.id, requester_id=agent.id, sender_type="user",
+                   body="Чужое сообщение"))
+    db.commit()
     click("closed", card)
     assert "Добавить сообщение" not in buttons()
+    history = buttons()["История"]
     stale, reply = submit(message(4, text="Ещё один ответ", reply_to_message={
         "from": {"id": 7654, "is_bot": True}, "text": prompt,
     }))
     assert stale.ticket_id is None and "закрыто" in reply
+
+    _, latest = click("history", history)
+    assert "Специалист" in latest and "Ответ специалиста" in latest
+    assert "Чужое сообщение" not in latest and len(latest) < 4000
+    next_part = buttons()["Следующая часть"]
+    _, denied = click("foreign-history", next_part, user=1234)
+    assert "Ответ специалиста" not in denied and "Конец ответа" not in denied
+    _, continuation = click("history-part", next_part)
+    assert "Конец ответа" in continuation
+    _, photo_history = click("history-older", buttons()["Раньше"])
+    assert "Вы" in photo_history and "Скриншот" in photo_history
+    _, text_history = click("history-older-again", buttons()["Раньше"])
+    assert "VPN всё ещё недоступен" in text_history
+    _, photo_again = click("history-newer", buttons()["Позже"])
+    assert "Скриншот" in photo_again
 
 
 def test_telegram_question_rate_and_global_queue_cap(api_context, monkeypatch):

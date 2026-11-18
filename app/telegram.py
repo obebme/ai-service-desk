@@ -18,8 +18,9 @@ MAIN_KEYBOARD = {
     "resize_keyboard": True,
     "is_persistent": True,
 }
-TICKET_CALLBACKS = frozenset({"ticket", "ticket_text", "ticket_photo"})
+TICKET_CALLBACKS = frozenset({"ticket", "ticket_text", "ticket_photo", "history"})
 TICKET_NUMBER = re.compile(r"[A-Z0-9-]{1,24}")
+HISTORY_ENTRY = re.compile(r"([0-9a-f]{32}):([0-9]{1,6})")
 FOLLOWUP_PROMPTS = {
     "ticket_text": "Ответьте на это сообщение текстом.",
     "ticket_photo": "Ответьте на это сообщение фотографией или скриншотом.",

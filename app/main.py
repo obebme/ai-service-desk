@@ -27,7 +27,9 @@ from app.schemas import (
     Analysis, MessageCreate, MessageView, TicketCreate, TicketPatch, TicketView,
     WorkflowMessageRequest, describe_responses,
 )
-from app.telegram import MENU_CALLBACKS, MENU_COMMANDS, TICKET_CALLBACKS, TICKET_NUMBER, replied_ticket_number
+from app.telegram import (
+    HISTORY_ENTRY, MENU_CALLBACKS, MENU_COMMANDS, TICKET_CALLBACKS, TICKET_NUMBER, replied_ticket_number,
+)
 from app.telegram_limits import lock_telegram_queue, telegram_queue_full, update_limit_reached
 from app.telegram_worker import run_telegram_worker
 from app.ticket_writes import create_ticket, get_or_create_user, record_ticket_message, record_ticket_update
@@ -286,13 +288,13 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
                 or not isinstance(data, str) or len(data) > 64
                 or not isinstance(callback_id, str) or not 1 <= len(callback_id) <= 80):
             return {"ok": True}
-        action, _, answer_id = data.partition(":")
+        action, _, argument = data.partition(":")
         if action in MENU_CALLBACKS and data == action:
             body = f"/{action}"
-        elif action in TICKET_CALLBACKS and TICKET_NUMBER.fullmatch(answer_id):
-            body = f"/{action} {answer_id}"
-        elif action in {"helped", "specialist"} and len(answer_id) == 32:
-            body = f"/{action} {answer_id}"
+        elif ((action in TICKET_CALLBACKS and TICKET_NUMBER.fullmatch(argument))
+              or (action == "history_entry" and HISTORY_ENTRY.fullmatch(argument))
+              or (action in {"helped", "specialist"} and len(argument) == 32)):
+            body = f"/{action} {argument}"
         else:
             return {"ok": True}
         update = {"message": {"message_id": origin.get("message_id"), "chat": chat,
