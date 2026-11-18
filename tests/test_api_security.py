@@ -4,7 +4,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 
-from app import main
+from app import main, panel_auth
 from app.models import Ticket, User
 
 
@@ -19,7 +19,7 @@ def test_bearer_token_maps_to_configured_role(monkeypatch):
 
 
 def test_bearer_token_rejects_unknown_value(monkeypatch):
-    monkeypatch.setattr(main, "ROLE_TOKENS", {"user": "user-secret", "agent": "", "admin": ""})
+    monkeypatch.setattr(panel_auth, "ROLE_TOKENS", {"user": "user-secret", "agent": "", "admin": ""})
     with pytest.raises(HTTPException) as error:
         main.principal(HTTPAuthorizationCredentials(scheme="Bearer", credentials="wrong"))
     assert error.value.status_code == 401

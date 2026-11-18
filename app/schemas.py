@@ -1,3 +1,4 @@
+from http import HTTPStatus
 import uuid
 from datetime import datetime
 from typing import Literal
@@ -100,3 +101,7 @@ class TicketView(BaseModel):
     created_at: datetime
     updated_at: datetime
     model_config = {"from_attributes": True}
+
+
+def describe_responses(*codes: int) -> dict:
+    return {code: {"description": HTTPStatus(code).phrase} for code in codes}

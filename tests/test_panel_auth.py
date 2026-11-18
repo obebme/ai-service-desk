@@ -6,7 +6,7 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
-from app import main
+from app import main, panel_auth
 from app.config import Settings
 from app.panel_auth import (
     CHALLENGE_COOKIE,
@@ -25,7 +25,7 @@ TEST_SIGNING_SECRET = "unit-test-session-signing-secret"
 
 def _set_auth_config(monkeypatch):
     monkeypatch.setattr(main.settings, "session_signing_secret", TEST_SIGNING_SECRET)
-    monkeypatch.setattr(main, "ROLE_TOKENS", {
+    monkeypatch.setattr(panel_auth, "ROLE_TOKENS", {
         "user": "user-role-token",
         "agent": "agent-role-token",
         "admin": "admin-role-token",

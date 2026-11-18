@@ -7,7 +7,8 @@ import pytest
 from fastapi.responses import HTMLResponse
 from sqlalchemy.exc import SQLAlchemyError
 
-from app import main
+from app import knowledge_ingest, main, panel_auth, ticket_writes
+from app.routers import panel
 from app.config import Settings
 from app.db import get_db as database_dependency
 from app.models import AuditLog, KnowledgeDocument, Message, Ticket
@@ -105,7 +106,7 @@ def _telegram_message(ticket, *, chat_id, created=None, channel="telegram", send
 
 def _stub_agent_user(monkeypatch):
     monkeypatch.setattr(
-        main, "get_or_create_user",
+        ticket_writes, "get_or_create_user",
         lambda _db, _telegram_id, _name="": type(
             "UserRef", (), {"id": uuid.uuid4()}
         )(),
@@ -117,7 +118,7 @@ def _client(monkeypatch, db, role="agent", renders=None):
     main.app.dependency_overrides[database_dependency] = lambda: db
     if renders is not None:
         monkeypatch.setattr(
-            main.templates, "TemplateResponse",
+            panel.templates, "TemplateResponse",
             lambda **kwargs: (
                 renders.append(kwargs)
                 or HTMLResponse("rendered", status_code=kwargs.get("status_code", 200))
@@ -335,7 +336,7 @@ def test_empty_update_uses_ticketpatch_validation_without_mutation(monkeypatch):
 def test_message_and_ticket_update_preserve_sender_audit_and_close_timestamps(monkeypatch):
     ticket = _ticket(1)
     db = _DB([ticket])
-    monkeypatch.setattr(main, "get_or_create_user",
+    monkeypatch.setattr(ticket_writes, "get_or_create_user",
                         lambda _db, _telegram_id, _name="": type("UserRef", (), {"id": uuid.uuid4()})())
 
     async def exercise():
@@ -407,7 +408,7 @@ def test_eligible_panel_reply_at_4000_characters_is_saved_pending_then_sent_once
         message = next(value for value in db.added if isinstance(value, Message))
         calls.append((chat_id, body, message.telegram_delivery_status, db.commits))
 
-    monkeypatch.setattr(main, "send_telegram_message", send)
+    monkeypatch.setattr(panel, "send_telegram_message", send)
     body = "x" * 4000
 
     async def exercise():
@@ -435,7 +436,7 @@ def test_eligible_panel_reply_at_4001_is_rejected_before_save_or_send(monkeypatc
     _stub_agent_user(monkeypatch)
     monkeypatch.setattr(main.settings, "telegram_token", "configured")
     calls = []
-    monkeypatch.setattr(main, "send_telegram_message", lambda *_args: calls.append(True))
+    monkeypatch.setattr(panel, "send_telegram_message", lambda *_args: calls.append(True))
     rendered = []
 
     async def exercise():
@@ -477,7 +478,7 @@ def test_only_private_telegram_user_message_is_eligible_recipient(monkeypatch):
     async def send(chat_id, body):
         calls.append((chat_id, body))
 
-    monkeypatch.setattr(main, "send_telegram_message", send)
+    monkeypatch.setattr(panel, "send_telegram_message", send)
 
     async def exercise():
         client, csrf = _client(monkeypatch, db)
@@ -509,7 +510,7 @@ def test_noneligible_panel_reply_is_saved_not_applicable_without_send(monkeypatc
     _stub_agent_user(monkeypatch)
     monkeypatch.setattr(main.settings, "telegram_token", "configured")
     calls = []
-    monkeypatch.setattr(main, "send_telegram_message", lambda *_args: calls.append(True))
+    monkeypatch.setattr(panel, "send_telegram_message", lambda *_args: calls.append(True))
 
     async def exercise():
         client, csrf = _client(monkeypatch, db)
@@ -534,7 +535,7 @@ def test_eligible_panel_reply_without_token_is_not_configured_and_not_sent(monke
     _stub_agent_user(monkeypatch)
     monkeypatch.setattr(main.settings, "telegram_token", "")
     calls = []
-    monkeypatch.setattr(main, "send_telegram_message", lambda *_args: calls.append(True))
+    monkeypatch.setattr(panel, "send_telegram_message", lambda *_args: calls.append(True))
 
     async def exercise():
         client, csrf = _client(monkeypatch, db)
@@ -563,7 +564,7 @@ def test_telegram_failure_preserves_message_and_redirects_unconfirmed(monkeypatc
         calls.append((chat_id, body))
         raise main.HTTPException(503, "Telegram message delivery failed")
 
-    monkeypatch.setattr(main, "send_telegram_message", fail)
+    monkeypatch.setattr(panel, "send_telegram_message", fail)
 
     async def exercise():
         client, csrf = _client(monkeypatch, db)
@@ -611,7 +612,7 @@ def test_delivery_outcome_commit_failure_redirects_and_leaves_message_pending(mo
     async def send(chat_id, body):
         calls.append((chat_id, body))
 
-    monkeypatch.setattr(main, "send_telegram_message", send)
+    monkeypatch.setattr(panel, "send_telegram_message", send)
 
     async def exercise():
         client, csrf = _client(monkeypatch, db)
@@ -639,10 +640,10 @@ def test_api_agent_message_does_not_send_telegram(monkeypatch):
     ticket = _ticket(57)
     db = _DB([ticket], messages=[_telegram_message(ticket, chat_id="private-chat-57")])
     _stub_agent_user(monkeypatch)
-    monkeypatch.setattr(main, "ROLE_TOKENS", {"user": "", "agent": "agent-test", "admin": ""})
+    monkeypatch.setattr(panel_auth, "ROLE_TOKENS", {"user": "", "agent": "agent-test", "admin": ""})
     monkeypatch.setattr(main.settings, "telegram_token", "configured")
     calls = []
-    monkeypatch.setattr(main, "send_telegram_message", lambda *_args: calls.append(True))
+    monkeypatch.setattr(panel, "send_telegram_message", lambda *_args: calls.append(True))
 
     async def exercise():
         client, _csrf = _client(monkeypatch, db)
@@ -671,7 +672,7 @@ def test_admin_knowledge_list_and_upload(monkeypatch):
         calls.append(True)
         return {"title": "runbook.txt", "chunks": 2}
 
-    monkeypatch.setattr(main, "_ingest_knowledge_document", ingest)
+    monkeypatch.setattr(panel, "ingest_knowledge_document", ingest)
 
     async def exercise():
         client, csrf = _client(monkeypatch, db, role="admin", renders=rendered)
@@ -704,7 +705,7 @@ def test_upload_failure_renders_error_without_success_redirect(monkeypatch):
     async def fail_ingest(_file, _db):
         raise main.HTTPException(status_code=415, detail="Only TXT files are supported")
 
-    monkeypatch.setattr(main, "_ingest_knowledge_document", fail_ingest)
+    monkeypatch.setattr(panel, "ingest_knowledge_document", fail_ingest)
 
     async def exercise():
         client, csrf = _client(monkeypatch, db, role="admin", renders=rendered)
@@ -730,12 +731,12 @@ def test_upload_type_and_size_limits_are_shared_with_api():
     async def exercise():
         unsupported = UploadFile(filename="runbook.exe", file=BytesIO(b"data"))
         with pytest.raises(main.HTTPException) as type_error:
-            await main._ingest_knowledge_document(unsupported, _DB())
+            await knowledge_ingest.ingest_knowledge_document(unsupported, _DB())
         assert type_error.value.status_code == 415
 
         oversized = UploadFile(filename="large.txt", file=BytesIO(b"x" * 10_000_001))
         with pytest.raises(main.HTTPException) as size_error:
-            await main._ingest_knowledge_document(oversized, _DB())
+            await knowledge_ingest.ingest_knowledge_document(oversized, _DB())
         assert size_error.value.status_code == 413
 
     asyncio.run(exercise())
@@ -765,7 +766,7 @@ def test_upload_rejects_text_that_postgresql_cannot_store(filename, content):
 
     file = UploadFile(filename=filename, file=BytesIO(content))
     with pytest.raises(main.HTTPException) as error:
-        asyncio.run(main._ingest_knowledge_document(file, _DB()))
+        asyncio.run(knowledge_ingest.ingest_knowledge_document(file, _DB()))
     assert error.value.status_code == 400
 
 
@@ -785,6 +786,6 @@ def test_waiting_for_reply_includes_tickets_created_without_messages():
             "INSERT INTO messages VALUES (1, 2, 'agent', '2026-01-01'), "
             "(2, 3, 'agent', '2026-01-01'), (3, 3, 'user', '2026-01-02')"
         )
-        waiting = connection.scalars(select(Ticket.status).where(main._awaiting_reply())
+        waiting = connection.scalars(select(Ticket.status).where(panel._awaiting_reply())
                                      .order_by(Ticket.id)).all()
     assert waiting == ["open", "in_progress"]
