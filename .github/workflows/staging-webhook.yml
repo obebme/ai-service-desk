@@ -1,15 +1,12 @@
 name: External staging webhook
 
 on:
-  schedule:
-    - cron: '4,14,24,34,44,54 * * * *'
   workflow_dispatch:
 
 permissions: {}
 
 jobs:
   probe:
-    if: github.event_name == 'workflow_dispatch' || vars.STAGING_WEBHOOK_MONITOR_ENABLED == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     env:
