@@ -6,7 +6,7 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
-from app import main
+from app import main, telegram
 from app.models import Message
 from app.schemas import Analysis
 
@@ -170,12 +170,12 @@ def test_telegram_delivery_failures_map_to_safe_503(monkeypatch, failure):
             return Response()
 
     monkeypatch.setattr(main.settings, "telegram_token", "telegram-test-secret")
-    monkeypatch.setattr(main, "httpx", SimpleNamespace(
+    monkeypatch.setattr(telegram, "httpx", SimpleNamespace(
         AsyncClient=FakeClient, HTTPError=httpx.HTTPError,
     ))
 
     with pytest.raises(HTTPException) as error:
-        asyncio.run(main.send_telegram_message("123", "test reply"))
+        asyncio.run(telegram.send_telegram_message("123", "test reply"))
 
     assert error.value.status_code == 503
     assert error.value.detail == "Telegram message delivery failed"

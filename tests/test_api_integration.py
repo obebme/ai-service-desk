@@ -10,7 +10,7 @@ from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
-from app import main
+from app import main, panel_auth
 from app.db import Base, get_db
 from app.models import (
     AuditLog, Department, KnowledgeChunk, KnowledgeDocument, Message, Ticket, User,
@@ -42,7 +42,7 @@ def api_context(monkeypatch):
         session.commit()
 
     session = Session(engine, expire_on_commit=False)
-    monkeypatch.setattr(main, "ROLE_TOKENS", {"agent": "agent-test", "admin": "admin-test"})
+    monkeypatch.setattr(panel_auth, "ROLE_TOKENS", {"agent": "agent-test", "admin": "admin-test"})
 
     monkeypatch.setattr(main.settings, "user_api_tokens", {
         identity: f"token-{identity}"

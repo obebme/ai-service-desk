@@ -10,6 +10,13 @@ from collections.abc import Mapping
 
 from fastapi import HTTPException, Request
 
+from app.config import settings
+
+ROLE_TOKENS = {
+    "agent": settings.agent_api_token,
+    "admin": settings.admin_api_token,
+}
+
 SESSION_COOKIE = "servicedesk_session"
 CHALLENGE_COOKIE = "servicedesk_login_challenge"
 SESSION_TTL_SECONDS = 8 * 60 * 60
