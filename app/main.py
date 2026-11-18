@@ -27,7 +27,7 @@ from app.schemas import (
     Analysis, MessageCreate, MessageView, TicketCreate, TicketPatch, TicketView,
     WorkflowMessageRequest, describe_responses,
 )
-from app.telegram import MENU_CALLBACKS, TICKET_CALLBACKS, TICKET_NUMBER, replied_ticket_number
+from app.telegram import MENU_CALLBACKS, MENU_COMMANDS, TICKET_CALLBACKS, TICKET_NUMBER, replied_ticket_number
 from app.telegram_worker import run_telegram_worker
 from app.ticket_writes import create_ticket, get_or_create_user, record_ticket_message, record_ticket_update
 
@@ -346,7 +346,10 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
         body.encode("utf-8")
     except UnicodeEncodeError:
         raise HTTPException(400, "Malformed Telegram text update") from None
-    if reply_number and ((photo_id and not body.startswith("/add ")) or not body.startswith("/")):
+    if reply_number and (
+        (photo_id and not body.startswith("/add "))
+        or (not body.startswith("/") and body.casefold() not in MENU_COMMANDS)
+    ):
         body = f"/add {reply_number} {body}".rstrip()
 
     telegram_id = str(telegram_user_id)

@@ -18,7 +18,7 @@ from app.gemini import GeminiError
 from app.models import Message, Ticket
 from app.rag import search
 from app.schemas import Analysis, TicketCreate
-from app.telegram import followup_prompt, send_telegram_message
+from app.telegram import MAIN_KEYBOARD, MENU_COMMANDS, followup_prompt, send_telegram_message
 from app.ticket_writes import create_ticket
 
 
@@ -27,7 +27,6 @@ TICKET_STATUSES = {
     "open": "открыто", "in_progress": "в работе", "waiting_for_user": "ждём вашего ответа",
     "resolved": "решено", "closed": "закрыто",
 }
-MAIN_MENU = [[("Задать вопрос", "question"), ("Мои обращения", "tickets")]]
 
 
 def _ticket_buttons(msg: Message, rows: list[list[tuple[str, str]]]) -> None:
@@ -92,13 +91,14 @@ def _telegram_ticket_command(db: Session, msg: Message) -> str | None:
         return None
 
     command, _, argument = msg.body.partition(" ")
+    command = MENU_COMMANDS.get(msg.body.casefold(), command)
     if command in {"/start", "/help", "/menu"}:
-        _ticket_buttons(msg, MAIN_MENU)
+        msg.analysis = {**(msg.analysis or {}), "reply_markup": MAIN_KEYBOARD}
         return "Выберите действие. Также можно сразу написать вопрос."
     if command == "/question":
         _ticket_buttons(msg, [[("Назад", "menu")]])
         return "Опишите проблему одним сообщением. Я поищу решение в базе знаний."
-    if command == "/tickets" or msg.body.casefold() == "мои обращения":
+    if command == "/tickets":
         tickets = list(db.scalars(select(Ticket).where(Ticket.requester_id == msg.requester_id)
                                   .order_by(Ticket.updated_at.desc(), Ticket.id.desc()).limit(10)))
         rows = [[(ticket.ticket_number, f"ticket:{ticket.ticket_number}")] for ticket in tickets]
@@ -201,7 +201,7 @@ async def process_message(db: Session, msg: Message) -> str:
         await _deliver_automatic_reply(db, msg, reply)
         return reply
     if msg.channel == "telegram" and msg.telegram_chat_id and (
-        msg.body.startswith("/") or msg.body.casefold() == "мои обращения"
+        msg.body.startswith("/") or msg.body.casefold() in MENU_COMMANDS
     ):
         reply = await run_in_threadpool(_telegram_ticket_command, db, msg)
         if reply is not None:

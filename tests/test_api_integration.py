@@ -1342,8 +1342,14 @@ def test_telegram_ticket_menu_and_replies(api_context, monkeypatch):
         return {b["text"]: b["callback_data"] for row in deliveries[-1]["inline_keyboard"] for b in row}
 
     submit(message(1, text="/start"))
-    assert "Задать вопрос" in buttons()
-    _, listing = click("list", buttons()["Мои обращения"])
+    assert deliveries[-1] == {
+        "keyboard": [[{"text": "Задать вопрос"}, {"text": "Мои обращения"}]],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+    _, question = submit(message(10, text="Задать вопрос"))
+    assert "Опишите проблему" in question
+    _, listing = submit(message(11, text="Мои обращения"))
     assert "ждём вашего ответа" in listing
     card = next(data for label, data in buttons().items() if ticket.ticket_number in label)
     _, forbidden = click("foreign", card, user=1234)
@@ -1369,6 +1375,10 @@ def test_telegram_ticket_menu_and_replies(api_context, monkeypatch):
 
     db.refresh(ticket)
     assert ticket.status == "in_progress"
+    menu, listing = submit(message(12, text="Мои обращения", reply_to_message={
+        "from": {"id": 7654, "is_bot": True}, "text": prompt,
+    }))
+    assert menu.ticket_id is None and ticket.ticket_number in listing
     ticket.status = "closed"
     db.commit()
     click("closed", card)

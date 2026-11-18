@@ -10,6 +10,14 @@ from app.config import settings
 
 
 MENU_CALLBACKS = frozenset({"menu", "question", "tickets"})
+QUESTION_BUTTON = "Задать вопрос"
+TICKETS_BUTTON = "Мои обращения"
+MENU_COMMANDS = {QUESTION_BUTTON.casefold(): "/question", TICKETS_BUTTON.casefold(): "/tickets"}
+MAIN_KEYBOARD = {
+    "keyboard": [[{"text": QUESTION_BUTTON}, {"text": TICKETS_BUTTON}]],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
 TICKET_CALLBACKS = frozenset({"ticket", "ticket_text", "ticket_photo"})
 TICKET_NUMBER = re.compile(r"[A-Z0-9-]{1,24}")
 FOLLOWUP_PROMPTS = {
