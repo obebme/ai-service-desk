@@ -28,6 +28,7 @@ from app.schemas import (
     WorkflowMessageRequest, describe_responses,
 )
 from app.telegram import MENU_CALLBACKS, MENU_COMMANDS, TICKET_CALLBACKS, TICKET_NUMBER, replied_ticket_number
+from app.telegram_limits import lock_telegram_queue, telegram_queue_full, update_limit_reached
 from app.telegram_worker import run_telegram_worker
 from app.ticket_writes import create_ticket, get_or_create_user, record_ticket_message, record_ticket_update
 
@@ -358,6 +359,8 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
     telegram_chat_id = str(chat_id) if chat_type == "private" else None
     name = sender.get("first_name", "")
     name = name.encode("utf-8", "replace").decode("utf-8")[:160] if isinstance(name, str) else ""
+    is_command = telegram_chat_id and (body.startswith("/") or body.casefold() in MENU_COMMANDS)
+    kind = "commands" if is_command else "questions"
 
     def find_existing():
         existing = db.scalar(select(Message).where(
@@ -373,16 +376,33 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
         ))
 
     def persist_message():
+        lock_telegram_queue(db)
         existing = find_existing()
         if existing is not None:
             db.commit()
-            return existing, True
+            return {"ok": True, "duplicate": True}
+        if telegram_queue_full(db, settings.telegram_queue_limit):
+            db.commit()
+            return {"ok": True, "limited": "queue"}
         user = get_or_create_user(db, telegram_id, name)
+        now = datetime.now(timezone.utc)
+        limited = update_limit_reached(db, user.id, kind, now)
+        if limited:
+            if kind != "questions" or not telegram_chat_id or update_limit_reached(db, user.id, "notice", now):
+                db.commit()
+                return {"ok": True, "limited": kind}
+            message_body = "/rate-limit"
+            analysis = {"telegram_update_kind": "notice"}
+        else:
+            message_body = body
+            analysis = {"telegram_update_kind": kind}
+            if photo_id:
+                analysis["photo_id"] = photo_id
+            if callback_id:
+                analysis["callback_id"] = callback_id
         msg = Message(requester_id=user.id, channel="telegram", external_message_id=external_id,
-                      body=body, telegram_chat_id=telegram_chat_id,
-                      analysis=({"photo_id": photo_id} if photo_id else
-                                {"callback_id": callback_id} if callback_id else None),
-                      processing_due_at=datetime.now(timezone.utc))
+                      body=message_body, telegram_chat_id=telegram_chat_id, analysis=analysis,
+                      processing_due_at=now, created_at=now)
         db.add(msg)
         try:
             db.commit()
@@ -392,13 +412,12 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
             if existing is None:
                 raise
             db.commit()
-            return existing, True
-        return msg, False
+            return {"ok": True, "duplicate": True}
+        if limited:
+            return {"ok": True, "limited": kind}
+        return {"ok": True, "message_id": str(msg.id), "queued": True}
 
-    msg, duplicate = await run_in_threadpool(persist_message)
-    if duplicate:
-        return {"ok": True, "duplicate": True}
-    return {"ok": True, "message_id": str(msg.id), "queued": True}
+    return await run_in_threadpool(persist_message)
 
 
 @app.post("/api/v1/internal/process-message", responses=describe_responses(401, 404))

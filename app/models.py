@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -33,6 +33,7 @@ class Department(Base):
 
 class Ticket(Base):
     __tablename__ = "tickets"
+    __table_args__ = (Index("ix_tickets_requester_created_at", "requester_id", "created_at"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     ticket_number: Mapped[str] = mapped_column(String(24), unique=True, index=True)
     requester_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
@@ -52,7 +53,10 @@ class Ticket(Base):
 
 class Message(Base):
     __tablename__ = "messages"
-    __table_args__ = (UniqueConstraint("channel", "external_message_id", name="uq_message_external"),)
+    __table_args__ = (
+        UniqueConstraint("channel", "external_message_id", name="uq_message_external"),
+        Index("ix_messages_requester_channel_created_at", "requester_id", "channel", "created_at"),
+    )
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     requester_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
     ticket_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("tickets.id", ondelete="RESTRICT"), index=True)

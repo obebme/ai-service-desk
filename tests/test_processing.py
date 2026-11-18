@@ -130,7 +130,8 @@ def test_database_commit_failure_propagates_without_success_reply(monkeypatch):
     monkeypatch.setattr(message_processing.settings, "telegram_token", "test-token")
     monkeypatch.setattr(message_processing, "analyze", successful_analysis)
     monkeypatch.setattr(message_processing, "search", no_evidence)
-    monkeypatch.setattr(message_processing, "create_ticket", create_ticket)
+    monkeypatch.setattr(message_processing, "_create_telegram_ticket",
+                        lambda db, msg, data: (create_ticket(db, msg.requester_id, data), None))
     monkeypatch.setattr(message_processing, "send_telegram_message", record_send)
 
     sentinel = object()
