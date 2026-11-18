@@ -21,13 +21,16 @@ jobs:
             echo '::error::Set the STAGING_WEBHOOK_URL repository secret'
             exit 1
           fi
+          response_headers=$(mktemp)
+          trap 'rm -f "$response_headers"' EXIT
           status=$(curl --proto '=https' --silent --connect-timeout 5 --max-time 15 \
-            --output /dev/null --write-out '%{http_code}' \
+            --dump-header "$response_headers" --output /dev/null --write-out '%{http_code}' \
             --header 'Content-Type: application/json' --data '{}' -- "$WEBHOOK_URL") || {
               echo '::error::Staging webhook is unreachable'
               exit 1
           }
           if [ "$status" != 401 ]; then
-            echo "::error::Staging webhook returned HTTP $status (expected 401)"
+            ngrok_error=$(awk 'tolower($1) == "ngrok-error-code:" && $2 ~ /^ERR_NGROK_[0-9]+\r?$/ { sub(/\r$/, "", $2); code = $2 } END { print code }' "$response_headers")
+            echo "::error::Staging webhook returned HTTP $status (expected 401)${ngrok_error:+, ngrok-error-code: $ngrok_error}"
             exit 1
           fi
