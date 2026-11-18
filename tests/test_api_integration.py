@@ -995,7 +995,7 @@ def test_panel_shows_telegram_queue_and_unconfirmed_reply(api_context, monkeypat
     assert detail.text.count("Automatic reply unconfirmed") == 1
 
 
-@pytest.mark.parametrize("operation", ["panel_queue", "rag_search"])
+@pytest.mark.parametrize("operation", ["panel_queue", "rag_search", "telegram_ticket"])
 def test_postgres_lock_wait_does_not_block_another_request(api_context, monkeypatch, operation):
     _, db = api_context
     engine = db.get_bind()
@@ -1022,7 +1022,7 @@ def test_postgres_lock_wait_does_not_block_another_request(api_context, monkeypa
         db.commit()
 
         async def classify(_):
-            return Analysis(summary="VPN help", confidence=0.95, needs_human=False,
+            return Analysis(summary="VPN help", confidence=0.95, needs_human=operation == "telegram_ticket",
                             suggested_action="Search the knowledge base")
 
         async def embed(_, *, task_type):
@@ -1037,7 +1037,8 @@ def test_postgres_lock_wait_does_not_block_another_request(api_context, monkeypa
             "headers": {"X-Workflow-Token": "lock-test-token"},
             "json": {"message_id": str(message.id)},
         }
-        lock = "LOCK TABLE knowledge_chunks IN ACCESS EXCLUSIVE MODE"
+        lock = ("LOCK TABLE departments IN ACCESS EXCLUSIVE MODE" if operation == "telegram_ticket"
+                else "LOCK TABLE knowledge_chunks IN ACCESS EXCLUSIVE MODE")
 
     lock_held = threading.Event()
     query_waiting = threading.Event()

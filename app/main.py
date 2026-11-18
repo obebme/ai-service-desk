@@ -156,20 +156,26 @@ def _measure_stage(message_id: uuid.UUID | None, stage: str):
                     message_id, stage, outcome, (perf_counter() - started) * 1000)
 
 
-async def _deliver_automatic_reply(db: Session, msg: Message, reply: str) -> None:
-    if msg.channel != "telegram" or not msg.telegram_chat_id or not settings.telegram_token:
-        return
+def _claim_automatic_reply(db: Session, msg: Message) -> bool:
     refresh = getattr(db, "refresh", None)
     if callable(refresh):
-        await run_in_threadpool(refresh, msg, with_for_update=True)
+        refresh(msg, with_for_update=True)
     if msg.telegram_delivery_status in {"accepted", "unconfirmed"}:
         db.commit()
-        return
+        return False
 
     # Claim delivery before sending. Telegram cannot deduplicate an ambiguous retry.
     msg.telegram_delivery_status = "unconfirmed"
     msg.telegram_delivery_updated_at = datetime.now(timezone.utc)
     db.commit()
+    return True
+
+
+async def _deliver_automatic_reply(db: Session, msg: Message, reply: str) -> None:
+    if msg.channel != "telegram" or not msg.telegram_chat_id or not settings.telegram_token:
+        return
+    if not await run_in_threadpool(_claim_automatic_reply, db, msg):
+        return
     try:
         with _measure_stage(msg.id, "telegram_delivery"):
             if (msg.analysis or {}).get("knowledge_answer") and msg.id:
@@ -270,7 +276,7 @@ async def process_message(db: Session, msg: Message) -> str:
     if msg.analysis and msg.analysis.get("reply"):
         reply = msg.analysis["reply"]
         if locked:
-            db.commit()
+            await run_in_threadpool(db.commit)
         await _deliver_automatic_reply(db, msg, reply)
         return reply
     if msg.channel == "telegram" and msg.telegram_chat_id and (
@@ -279,7 +285,7 @@ async def process_message(db: Session, msg: Message) -> str:
         reply = await run_in_threadpool(_telegram_ticket_command, db, msg)
         if reply is not None:
             msg.analysis = {**(msg.analysis or {}), "reply": reply}
-            db.commit()
+            await run_in_threadpool(db.commit)
             if (callback_id := msg.analysis.get("callback_id")) and settings.telegram_token:
                 try:
                     async with httpx.AsyncClient(timeout=3) as client:
@@ -319,6 +325,16 @@ async def process_message(db: Session, msg: Message) -> str:
         reason = "ai_error"
         logger.warning("message_ai_error message_id=%s error_type=%s", msg.id, type(exc).__name__)
 
+    reply = await run_in_threadpool(_save_processing_result, db, msg, classification, reason, answer)
+    logger.info("message_decision message_id=%s reason=%s", msg.id, reason or "knowledge_answer")
+    await _deliver_automatic_reply(db, msg, reply)
+    return reply
+
+
+def _save_processing_result(
+    db: Session, msg: Message, classification: Analysis | None, reason: str | None,
+    answer: tuple[str, list[str]] | None,
+) -> str:
     if reason is not None:
         summary = classification.summary if classification is not None else ""
         subject = summary.strip()[:240].strip()
@@ -346,8 +362,6 @@ async def process_message(db: Session, msg: Message) -> str:
         msg.analysis = {"classification": classification.model_dump(), "reply": reply,
                         "knowledge_answer": answer_text, "sources": sources}
     db.commit()
-    logger.info("message_decision message_id=%s reason=%s", msg.id, reason or "knowledge_answer")
-    await _deliver_automatic_reply(db, msg, reply)
     return reply
 
 
@@ -662,7 +676,8 @@ async def _dispatch_telegram_message(message_id):
             logger.warning("telegram_n8n_fallback message_id=%s error_type=%s",
                            message_id, type(exc).__name__)
 
-    with SessionLocal() as db:
+    db = SessionLocal()
+    try:
         msg = await run_in_threadpool(db.get, Message, message_id)
         if msg is None:
             return
@@ -672,6 +687,8 @@ async def _dispatch_telegram_message(message_id):
             logger.warning("telegram_n8n_fallback message_id=%s reason=missing_saved_reply", message_id)
         # A workflow may still be processing this row. Use the same lock and saved result.
         await process_message(db, msg)
+    finally:
+        await run_in_threadpool(db.close)
 
 
 async def _telegram_processing_worker():
