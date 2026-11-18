@@ -61,15 +61,27 @@ async def send_telegram_message(
             {"text": "Помогло", "callback_data": f"helped:{answer_id.hex}"},
             {"text": "Нужен специалист", "callback_data": f"specialist:{answer_id.hex}"},
         ]]}
+    await _send_telegram("sendMessage", payload)
+
+
+async def send_telegram_photo(chat_id: str, file_id: str, caption: str, *, reply_markup: dict) -> None:
+    await _send_telegram("sendPhoto", {
+        "chat_id": chat_id, "photo": file_id, "caption": caption, "reply_markup": reply_markup,
+    })
+
+
+async def _send_telegram(method: str, payload: dict) -> None:
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(
-                f"https://api.telegram.org/bot{settings.telegram_token}/sendMessage",
+                f"https://api.telegram.org/bot{settings.telegram_token}/{method}",
                 # Do not set parse_mode: user/model text must be delivered as plain text.
                 json=payload,
             )
             response.raise_for_status()
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
+        if method == "sendPhoto" and isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 400:
+            raise HTTPException(404, "Telegram photo unavailable") from None
         # Never expose the Bot API URL (which includes the token) in error details.
         raise HTTPException(503, "Telegram message delivery failed") from None
 

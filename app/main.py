@@ -292,7 +292,7 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
         if action in MENU_CALLBACKS and data == action:
             body = f"/{action}"
         elif ((action in TICKET_CALLBACKS and TICKET_NUMBER.fullmatch(argument))
-              or (action == "history_entry" and HISTORY_ENTRY.fullmatch(argument))
+              or (action in {"history_entry", "history_photo"} and HISTORY_ENTRY.fullmatch(argument))
               or (action in {"helped", "specialist"} and len(argument) == 32)):
             body = f"/{action} {argument}"
         else:
