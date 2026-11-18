@@ -1,5 +1,6 @@
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.config import settings
 from app.gemini import embed
@@ -7,6 +8,10 @@ from app.gemini import embed
 
 async def search(db: Session, query: str, limit: int = 5) -> list[dict]:
     vector = await embed(query, task_type="RETRIEVAL_QUERY")
+    return await run_in_threadpool(_search_by_vector, db, vector, limit)
+
+
+def _search_by_vector(db: Session, vector: list[float], limit: int) -> list[dict]:
     rows = db.execute(text("""
       SELECT c.content, d.title, d.source_name, 1 - (c.embedding <=> CAST(:embedding AS vector)) AS score
       FROM knowledge_chunks c JOIN knowledge_documents d ON d.id = c.document_id
