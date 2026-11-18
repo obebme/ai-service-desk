@@ -18,11 +18,22 @@ from app.gemini import GeminiError
 from app.models import Message, Ticket
 from app.rag import search
 from app.schemas import Analysis, TicketCreate
-from app.telegram import send_telegram_message
+from app.telegram import followup_prompt, send_telegram_message
 from app.ticket_writes import create_ticket
 
 
 logger = logging.getLogger("uvicorn.error").getChild(__name__)
+TICKET_STATUSES = {
+    "open": "открыто", "in_progress": "в работе", "waiting_for_user": "ждём вашего ответа",
+    "resolved": "решено", "closed": "закрыто",
+}
+MAIN_MENU = [[("Задать вопрос", "question"), ("Мои обращения", "tickets")]]
+
+
+def _ticket_buttons(msg: Message, rows: list[list[tuple[str, str]]]) -> None:
+    msg.analysis = {**(msg.analysis or {}), "reply_markup": {"inline_keyboard": [
+        [{"text": label, "callback_data": data} for label, data in row] for row in rows
+    ]}}
 
 
 @contextmanager
@@ -59,7 +70,9 @@ async def _deliver_automatic_reply(db: Session, msg: Message, reply: str) -> Non
         return
     try:
         with _measure_stage(msg.id, "telegram_delivery"):
-            if (msg.analysis or {}).get("knowledge_answer") and msg.id:
+            if markup := (msg.analysis or {}).get("reply_markup"):
+                await send_telegram_message(msg.telegram_chat_id, reply, reply_markup=markup)
+            elif (msg.analysis or {}).get("knowledge_answer") and msg.id:
                 await send_telegram_message(msg.telegram_chat_id, reply, answer_id=msg.id)
             else:
                 await send_telegram_message(msg.telegram_chat_id, reply)
@@ -79,17 +92,43 @@ def _telegram_ticket_command(db: Session, msg: Message) -> str | None:
         return None
 
     command, _, argument = msg.body.partition(" ")
+    if command in {"/start", "/help", "/menu"}:
+        _ticket_buttons(msg, MAIN_MENU)
+        return "Выберите действие. Также можно сразу написать вопрос."
+    if command == "/question":
+        _ticket_buttons(msg, [[("Назад", "menu")]])
+        return "Опишите проблему одним сообщением. Я поищу решение в базе знаний."
     if command == "/tickets" or msg.body.casefold() == "мои обращения":
         tickets = list(db.scalars(select(Ticket).where(Ticket.requester_id == msg.requester_id)
                                   .order_by(Ticket.updated_at.desc(), Ticket.id.desc()).limit(10)))
+        rows = [[(ticket.ticket_number, f"ticket:{ticket.ticket_number}")] for ticket in tickets]
+        _ticket_buttons(msg, [*rows, [("Назад", "menu")]])
         if not tickets:
             return "У вас пока нет обращений."
-        statuses = {"open": "открыто", "in_progress": "в работе", "waiting_for_user": "ждём вашего ответа",
-                    "resolved": "решено", "closed": "закрыто"}
-        lines = [f"{ticket.ticket_number} · {statuses.get(ticket.status, ticket.status)} · "
+        lines = [f"{ticket.ticket_number} · {TICKET_STATUSES.get(ticket.status, ticket.status)} · "
                  f"{ticket.updated_at:%d.%m %H:%M} UTC\n{ticket.subject[:120]}" for ticket in tickets]
-        return "Ваши последние обращения\n\n" + "\n".join(lines) + (
-            "\n\nЧтобы дополнить обращение, отправьте /add НОМЕР текст.")
+        return "Ваши последние обращения\n\n" + "\n".join(lines)
+    if command in {"/ticket", "/ticket_text", "/ticket_photo"}:
+        ticket = db.scalar(select(Ticket).where(
+            Ticket.requester_id == msg.requester_id, Ticket.ticket_number == argument.strip().upper(),
+        ))
+        back = [("Назад", "tickets")]
+        if ticket is None:
+            _ticket_buttons(msg, [back])
+            return "Обращение не найдено."
+        if command == "/ticket":
+            rows = [back]
+            if ticket.status != "closed":
+                rows = [[("Добавить сообщение", f"ticket_text:{ticket.ticket_number}")],
+                        [("Прикрепить скриншот", f"ticket_photo:{ticket.ticket_number}")], back]
+            _ticket_buttons(msg, rows)
+            status = TICKET_STATUSES.get(ticket.status, ticket.status)
+            return f"{ticket.ticket_number}\n{ticket.subject}\nСтатус: {status}"
+        if ticket.status == "closed":
+            _ticket_buttons(msg, [back])
+            return "Обращение закрыто. Отправьте новый вопрос, чтобы создать новое обращение."
+        msg.analysis = {**(msg.analysis or {}), "reply_markup": {"force_reply": True}}
+        return followup_prompt(command[1:], ticket.ticket_number)
     if command == "/add":
         number, _, body = argument.strip().partition(" ")
         if not number or (not body.strip() and not (msg.analysis or {}).get("photo_id")):
@@ -106,6 +145,7 @@ def _telegram_ticket_command(db: Session, msg: Message) -> str | None:
         if ticket.status in {"waiting_for_user", "resolved"}:
             ticket.status = "in_progress"
         ticket.updated_at = datetime.now(timezone.utc)
+        _ticket_buttons(msg, [[("Открыть обращение", f"ticket:{ticket.ticket_number}")]])
         return f"Добавил сообщение в обращение {ticket.ticket_number}."
     if command in {"/helped", "/specialist"}:
         try:
@@ -123,6 +163,7 @@ def _telegram_ticket_command(db: Session, msg: Message) -> str | None:
         if original.ticket_id:
             ticket = db.get(Ticket, original.ticket_id)
             if ticket is not None:
+                _ticket_buttons(msg, [[("Открыть обращение", f"ticket:{ticket.ticket_number}")]])
                 return f"Для этого вопроса уже создано обращение {ticket.ticket_number}."
             return "Для этого вопроса уже создавалось обращение."
         if command == "/helped":
@@ -136,13 +177,12 @@ def _telegram_ticket_command(db: Session, msg: Message) -> str | None:
         ))
         original.ticket_id = ticket.id
         original.analysis = {**analysis, "escalation_reason": "user_requested_specialist"}
+        _ticket_buttons(msg, [[("Открыть обращение", f"ticket:{ticket.ticket_number}")]])
         return f"Создал обращение {ticket.ticket_number}. Специалист продолжит разбор."
     help_text = (
         "Мои обращения — /tickets. Дополнить обращение — /add НОМЕР текст. "
         "Новый вопрос можно отправить обычным сообщением."
     )
-    if command in {"/help", "/start"}:
-        return help_text
     if command.startswith("/"):
         return f"Неизвестная команда. {help_text}"
     return None
