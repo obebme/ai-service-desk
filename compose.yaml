@@ -5,7 +5,7 @@ services:
       POSTGRES_DB: servicedesk
       POSTGRES_USER: servicedesk
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-    ports: ["127.0.0.1:5433:5432"]
+    ports: ["127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"]
     volumes: ["pgdata:/var/lib/postgresql/data"]
     restart: unless-stopped
     healthcheck:
@@ -29,7 +29,7 @@ services:
       DATABASE_URL: postgresql+psycopg://servicedesk@db:5432/servicedesk
       PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       N8N_WEBHOOK_URL: ${N8N_WEBHOOK_URL:-}
-    ports: ["127.0.0.1:8000:8000"]
+    ports: ["127.0.0.1:${API_HOST_PORT:-8000}:8000"]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live')"]
@@ -43,7 +43,7 @@ services:
   n8n:
     image: n8nio/n8n:latest
     profiles: [automation]
-    ports: ["127.0.0.1:5678:5678"]
+    ports: ["127.0.0.1:${N8N_HOST_PORT:-5678}:5678"]
     environment:
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?Set N8N_ENCRYPTION_KEY in .env}
       N8N_DIAGNOSTICS_ENABLED: "false"
