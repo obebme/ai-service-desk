@@ -5,6 +5,7 @@ import secrets
 import uuid
 from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime, timedelta, timezone
+from http import HTTPStatus
 from pathlib import Path
 from time import perf_counter
 from urllib.parse import urlencode
@@ -86,6 +87,10 @@ app.mount(
 )
 
 
+def describe_responses(*codes: int) -> dict:
+    return {code: {"description": HTTPStatus(code).phrase} for code in codes}
+
+
 @app.middleware("http")
 async def disable_panel_page_caching(request: Request, call_next):
     if request.method == "POST" and request.url.path in KNOWLEDGE_UPLOAD_PATHS:
@@ -146,7 +151,7 @@ def require(*roles):
     return check
 
 
-@app.get("/ui/login", response_class=HTMLResponse)
+@app.get("/ui/login", response_class=HTMLResponse, responses=describe_responses(303))
 def panel_login_page(request: Request):
     secret = settings.validate_session_signing_secret()
     if read_session(request.cookies.get(SESSION_COOKIE), secret):
@@ -172,7 +177,11 @@ def panel_login_page(request: Request):
     return response
 
 
-@app.post("/ui/login")
+@app.post(
+    "/ui/login",
+    status_code=303, response_class=RedirectResponse,
+    responses=describe_responses(400, 401),
+)
 async def panel_login(request: Request):
     secret = settings.validate_session_signing_secret()
     form = await request.form()
@@ -221,7 +230,7 @@ async def panel_login(request: Request):
     return response
 
 
-@app.post("/ui/logout")
+@app.post("/ui/logout", status_code=303, response_class=RedirectResponse, responses=describe_responses(400))
 async def panel_logout(request: Request):
     secret = settings.validate_session_signing_secret()
     form = await request.form()
@@ -616,7 +625,11 @@ def ready(db: Session = Depends(get_db)):
     return {"status": "ready"}
 
 
-@app.post("/api/v1/tickets", response_model=TicketView, status_code=201)
+@app.post(
+    "/api/v1/tickets",
+    response_model=TicketView, status_code=201,
+    responses=describe_responses(400, 401, 403),
+)
 def create_ticket_api(data: TicketCreate, role: str = Depends(require("user", "agent", "admin")),
                       x_telegram_user_id: str | None = Header(default=None), db: Session = Depends(get_db)):
     if role == "user" and not x_telegram_user_id:
@@ -630,7 +643,7 @@ def create_ticket_api(data: TicketCreate, role: str = Depends(require("user", "a
     return ticket
 
 
-@app.get("/api/v1/tickets", response_model=list[TicketView])
+@app.get("/api/v1/tickets", response_model=list[TicketView], responses=describe_responses(401))
 def list_tickets(status: str | None = None, role: str = Depends(require("user", "agent", "admin")),
                  x_telegram_user_id: str | None = Header(default=None), db: Session = Depends(get_db)):
     query = select(Ticket).order_by(Ticket.created_at.desc()).limit(100)
@@ -644,7 +657,7 @@ def list_tickets(status: str | None = None, role: str = Depends(require("user", 
     return list(db.scalars(query))
 
 
-@app.get("/api/v1/tickets/{ticket_id}", response_model=TicketView)
+@app.get("/api/v1/tickets/{ticket_id}", response_model=TicketView, responses=describe_responses(401, 404))
 def ticket_detail(ticket_id: uuid.UUID, role: str = Depends(require("user", "agent", "admin")),
                   x_telegram_user_id: str | None = Header(default=None), db: Session = Depends(get_db)):
     ticket = db.get(Ticket, ticket_id)
@@ -657,13 +670,21 @@ def ticket_detail(ticket_id: uuid.UUID, role: str = Depends(require("user", "age
     return ticket
 
 
-@app.patch("/api/v1/tickets/{ticket_id}", response_model=TicketView)
+@app.patch(
+    "/api/v1/tickets/{ticket_id}",
+    response_model=TicketView,
+    responses=describe_responses(401, 403, 404),
+)
 def update_ticket(ticket_id: uuid.UUID, data: TicketPatch, role: str = Depends(require("agent", "admin")),
                   db: Session = Depends(get_db)):
     return _record_ticket_update(db, ticket_id, data)
 
 
-@app.get("/api/v1/tickets/{ticket_id}/messages", response_model=list[MessageView])
+@app.get(
+    "/api/v1/tickets/{ticket_id}/messages",
+    response_model=list[MessageView],
+    responses=describe_responses(401, 403, 404),
+)
 def list_ticket_messages(ticket_id: uuid.UUID, role: str = Depends(require("user", "agent", "admin")),
                          x_telegram_user_id: str | None = Header(default=None), db: Session = Depends(get_db)):
     ticket = db.get(Ticket, ticket_id)
@@ -712,7 +733,7 @@ def _awaiting_reply():
     return Ticket.status.in_(("open", "in_progress")) & (func.coalesce(latest_sender, "user") == "user")
 
 
-@app.get("/ui/tickets", response_class=HTMLResponse)
+@app.get("/ui/tickets", response_class=HTMLResponse, responses=describe_responses(303, 403))
 async def panel_ticket_queue(request: Request, db: Session = Depends(get_db)):
     payload = _panel_session(request)
     if isinstance(payload, RedirectResponse):
@@ -779,7 +800,7 @@ async def panel_ticket_queue(request: Request, db: Session = Depends(get_db)):
     )
 
 
-@app.get("/ui/tickets/{ticket_id}", response_class=HTMLResponse)
+@app.get("/ui/tickets/{ticket_id}", response_class=HTMLResponse, responses=describe_responses(303, 404))
 async def panel_ticket_detail(ticket_id: uuid.UUID, request: Request,
                               db: Session = Depends(get_db)):
     payload = _panel_session(request)
@@ -814,7 +835,7 @@ async def panel_ticket_detail(ticket_id: uuid.UUID, request: Request,
     )
 
 
-@app.get("/ui/tickets/{ticket_id}/photos/{message_id}")
+@app.get("/ui/tickets/{ticket_id}/photos/{message_id}", responses=describe_responses(303, 404, 503))
 async def panel_ticket_photo(ticket_id: uuid.UUID, message_id: uuid.UUID, request: Request,
                              db: Session = Depends(get_db)):
     payload = _panel_session(request)
@@ -850,7 +871,11 @@ async def panel_ticket_photo(ticket_id: uuid.UUID, message_id: uuid.UUID, reques
                     headers={"X-Content-Type-Options": "nosniff"})
 
 
-@app.post("/ui/tickets/{ticket_id}/claim")
+@app.post(
+    "/ui/tickets/{ticket_id}/claim",
+    status_code=303, response_class=RedirectResponse,
+    responses=describe_responses(400, 403, 404, 409),
+)
 async def panel_claim_ticket(ticket_id: uuid.UUID, request: Request, db: Session = Depends(get_db)):
     payload = _panel_session(request)
     if isinstance(payload, RedirectResponse):
@@ -875,7 +900,11 @@ async def panel_claim_ticket(ticket_id: uuid.UUID, request: Request, db: Session
     return RedirectResponse(f"/ui/tickets/{ticket.id}", status_code=303)
 
 
-@app.post("/ui/tickets/{ticket_id}/messages")
+@app.post(
+    "/ui/tickets/{ticket_id}/messages",
+    status_code=303, response_class=RedirectResponse,
+    responses=describe_responses(400, 404),
+)
 async def panel_add_ticket_message(ticket_id: uuid.UUID, request: Request,
                                    db: Session = Depends(get_db)):
     payload = _panel_session(request)
@@ -960,7 +989,11 @@ async def panel_add_ticket_message(ticket_id: uuid.UUID, request: Request,
     )
 
 
-@app.post("/ui/tickets/{ticket_id}/update")
+@app.post(
+    "/ui/tickets/{ticket_id}/update",
+    status_code=303, response_class=RedirectResponse,
+    responses=describe_responses(400, 403, 404),
+)
 async def panel_update_ticket(ticket_id: uuid.UUID, request: Request,
                               db: Session = Depends(get_db)):
     payload = _panel_session(request)
@@ -982,7 +1015,7 @@ async def panel_update_ticket(ticket_id: uuid.UUID, request: Request,
     return RedirectResponse(f"/ui/tickets/{ticket_id}", status_code=303)
 
 
-@app.get("/ui/knowledge", response_class=HTMLResponse)
+@app.get("/ui/knowledge", response_class=HTMLResponse, responses=describe_responses(303, 403))
 async def panel_knowledge(request: Request, db: Session = Depends(get_db)):
     payload = _panel_session(request, admin_only=True)
     if isinstance(payload, RedirectResponse):
@@ -1005,7 +1038,11 @@ async def panel_knowledge(request: Request, db: Session = Depends(get_db)):
     )
 
 
-@app.post("/ui/knowledge/upload")
+@app.post(
+    "/ui/knowledge/upload",
+    status_code=303, response_class=RedirectResponse,
+    responses=describe_responses(400, 403, 411, 413, 415, 503),
+)
 async def panel_upload_knowledge(request: Request, db: Session = Depends(get_db)):
     payload = _panel_session(request, admin_only=True)
     if isinstance(payload, RedirectResponse):
@@ -1034,7 +1071,11 @@ async def panel_upload_knowledge(request: Request, db: Session = Depends(get_db)
     return RedirectResponse(f"/ui/knowledge?success={quote(message)}", status_code=303)
 
 
-@app.post("/api/v1/tickets/{ticket_id}/messages", status_code=201)
+@app.post(
+    "/api/v1/tickets/{ticket_id}/messages",
+    status_code=201,
+    responses=describe_responses(401, 403, 404),
+)
 def add_message(ticket_id: uuid.UUID, data: MessageCreate,
                 role: str = Depends(require("user", "agent", "admin")),
                 x_telegram_user_id: str | None = Header(default=None), db: Session = Depends(get_db)):
@@ -1055,7 +1096,7 @@ def add_message(ticket_id: uuid.UUID, data: MessageCreate,
     return {"id": str(msg.id), "created_at": msg.created_at}
 
 
-@app.post("/api/v1/ai/analyze", response_model=Analysis)
+@app.post("/api/v1/ai/analyze", response_model=Analysis, responses=describe_responses(401, 403, 503))
 async def ai_analyze(data: MessageCreate, role: str = Depends(require("agent", "admin")),
                      db: Session = Depends(get_db)):
     try:
@@ -1100,25 +1141,29 @@ async def _ingest_knowledge_document(file: UploadFile, db: Session) -> dict:
     return {"id": str(doc.id), "title": doc.title, "status": doc.status, "chunks": len(chunks)}
 
 
-@app.post("/api/v1/knowledge/documents", status_code=201)
+@app.post(
+    "/api/v1/knowledge/documents",
+    status_code=201,
+    responses=describe_responses(400, 401, 403, 411, 413, 415, 503),
+)
 async def upload_document(file: UploadFile = File(...), role: str = Depends(require("admin")),
                           db: Session = Depends(get_db)):
     return await _ingest_knowledge_document(file, db)
 
 
-@app.get("/api/v1/knowledge/documents")
+@app.get("/api/v1/knowledge/documents", responses=describe_responses(401, 403))
 def list_documents(role: str = Depends(require("agent", "admin")), db: Session = Depends(get_db)):
     return [{"id": str(d.id), "title": d.title, "source_name": d.source_name, "status": d.status}
             for d in db.scalars(select(KnowledgeDocument).order_by(KnowledgeDocument.created_at.desc()))]
 
 
-@app.get("/api/v1/analytics/overview")
+@app.get("/api/v1/analytics/overview", responses=describe_responses(401, 403))
 def overview(role: str = Depends(require("agent", "admin")), db: Session = Depends(get_db)):
     return {status: count for status, count in db.execute(
         select(Ticket.status, func.count()).group_by(Ticket.status)).all()}
 
 
-@app.post("/integrations/telegram/webhook")
+@app.post("/integrations/telegram/webhook", responses=describe_responses(400, 401))
 async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: str | None = Header(default=None),
                            db: Session = Depends(get_db)):
     if not settings.telegram_webhook_secret or not secrets.compare_digest(
@@ -1316,7 +1361,7 @@ async def _telegram_processing_worker():
             await asyncio.sleep(2)
 
 
-@app.post("/api/v1/internal/process-message")
+@app.post("/api/v1/internal/process-message", responses=describe_responses(401, 404))
 async def process_message_from_workflow(payload: WorkflowMessageRequest,
                                         x_workflow_token: str | None = Header(default=None),
                                         db: Session = Depends(get_db)):

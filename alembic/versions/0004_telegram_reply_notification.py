@@ -15,7 +15,7 @@ def existing_message_columns():
 
 
 def upgrade():
-    # Fresh installs may already have these columns from metadata.create_all.
+    # Older installations may have received these columns from the former 0001 migration.
     existing = existing_message_columns()
     if "telegram_chat_id" not in existing:
         op.add_column(
