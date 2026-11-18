@@ -481,8 +481,11 @@ def test_concurrent_process_message_runs_ai_once_and_reuses_saved_result(
     )) == 1
 
 
-@pytest.mark.parametrize("failure", ["connect", "http", "timeout_after_processing", "timeout_during_processing"])
-def test_n8n_failure_falls_back_without_duplicate_ticket_or_reply(api_context, monkeypatch, failure):
+@pytest.mark.parametrize("outcome", [
+    "connect", "http", "timeout_after_processing", "timeout_during_processing",
+    "ack_without_result", "ack_with_result",
+])
+def test_n8n_dispatch_requires_saved_result_without_duplicates(api_context, monkeypatch, outcome):
     request, db = api_context
     sessions = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
     monkeypatch.setattr(main, "SessionLocal", sessions)
@@ -503,6 +506,7 @@ def test_n8n_failure_falls_back_without_duplicate_ticket_or_reply(api_context, m
     message_id, claim_until = main._claim_telegram_message()
     classifications = []
     deliveries = []
+    processing_calls = []
     real_client = httpx.AsyncClient
 
     async def scenario():
@@ -521,7 +525,7 @@ def test_n8n_failure_falls_back_without_duplicate_ticket_or_reply(api_context, m
             async def analyze(body):
                 classifications.append(body)
                 ai_started.set()
-                if failure == "timeout_during_processing":
+                if outcome == "timeout_during_processing":
                     await asyncio.wait_for(release_ai.wait(), 3)
                 return Analysis(summary=body, needs_human=True, confidence=0.95, suggested_action="review")
 
@@ -529,17 +533,22 @@ def test_n8n_failure_falls_back_without_duplicate_ticket_or_reply(api_context, m
                 deliveries.append((chat_id, reply))
 
             async def process(session, message):
+                processing_calls.append(message.id)
                 if ai_started.is_set():
                     release_ai.set()
                 return await process_message(session, message)
 
             async def n8n(request):
                 nonlocal workflow_task
-                if failure == "connect":
+                if outcome == "connect":
                     raise httpx.ConnectError("unavailable", request=request)
-                if failure == "http":
+                if outcome == "http":
                     return httpx.Response(502)
-                if failure == "timeout_after_processing":
+                if outcome == "ack_without_result":
+                    return httpx.Response(200, json={"message": "Workflow started"})
+                if outcome == "ack_with_result":
+                    return httpx.Response(200, json={"reply": await workflow()})
+                if outcome == "timeout_after_processing":
                     await workflow()
                 else:
                     workflow_task = asyncio.create_task(workflow())
@@ -557,6 +566,9 @@ def test_n8n_failure_falls_back_without_duplicate_ticket_or_reply(api_context, m
                 release_ai.set()
                 if workflow_task is not None:
                     await asyncio.wait_for(workflow_task, 5)
+            assert len(deliveries) == 1
+            if outcome == "ack_with_result":
+                assert processing_calls == [message_id]
             assert await workflow() == deliveries[0][1]
 
     asyncio.run(scenario())
@@ -628,6 +640,50 @@ def test_failed_background_attempt_keeps_message_for_retry(api_context, monkeypa
     main._finish_telegram_attempt(message_id, first_claim, True)
     db.refresh(msg)
     assert msg.processing_due_at is not None
+
+
+def test_n8n_ack_without_result_is_requeued_when_direct_processing_fails(api_context, monkeypatch):
+    request, db = api_context
+    sessions = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+    monkeypatch.setattr(main, "SessionLocal", sessions)
+    monkeypatch.setattr(main.settings, "telegram_webhook_secret", "telegram-test-secret")
+    monkeypatch.setattr(main.settings, "n8n_webhook_url", "http://n8n.test/webhook/incoming")
+    response = _telegram_request(request, {
+        "message": {"message_id": 607, "from": {"id": 707},
+                    "chat": {"id": 707, "type": "private"}, "text": "Need help"},
+    })
+    assert response.status_code == 200 and response.json()["queued"]
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(main.httpx, "AsyncClient", lambda **kwargs: real_client(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(204)), **kwargs))
+
+    async def processing_failed(_db, _message):
+        raise RuntimeError("Direct processing failed")
+
+    async def scenario():
+        finished = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        finish = main._finish_telegram_attempt
+
+        def mark_finished(*args):
+            finish(*args)
+            loop.call_soon_threadsafe(finished.set)
+
+        monkeypatch.setattr(main, "process_message", processing_failed)
+        monkeypatch.setattr(main, "_finish_telegram_attempt", mark_finished)
+        worker = asyncio.create_task(main._telegram_processing_worker())
+        try:
+            await asyncio.wait_for(finished.wait(), 5)
+        finally:
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+
+    asyncio.run(scenario())
+    msg = db.scalars(select(Message)).one()
+    assert msg.processing_due_at is not None
+    assert msg.processing_due_at > datetime.now(timezone.utc)
+    assert msg.analysis is None and msg.ticket_id is None
 
 
 def _seed_retention_rows(db, now):
