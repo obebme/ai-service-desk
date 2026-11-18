@@ -250,7 +250,7 @@ def _awaiting_reply():
 
 
 @router.get("/ui/tickets", response_class=HTMLResponse, responses=describe_responses(303, 403))
-async def panel_ticket_queue(request: Request, db: Session = Depends(get_db)):
+def panel_ticket_queue(request: Request, db: Session = Depends(get_db)):
     payload = _panel_session(request)
     if isinstance(payload, RedirectResponse):
         return payload
@@ -318,8 +318,7 @@ async def panel_ticket_queue(request: Request, db: Session = Depends(get_db)):
 
 
 @router.get("/ui/tickets/{ticket_id}", response_class=HTMLResponse, responses=describe_responses(303, 404))
-async def panel_ticket_detail(ticket_id: uuid.UUID, request: Request,
-                              db: Session = Depends(get_db)):
+def panel_ticket_detail(ticket_id: uuid.UUID, request: Request, db: Session = Depends(get_db)):
     payload = _panel_session(request)
     if isinstance(payload, RedirectResponse):
         return payload
@@ -404,7 +403,12 @@ async def panel_claim_ticket(ticket_id: uuid.UUID, request: Request, db: Session
     agent = payload.get("agent")
     if not agent or agent not in settings.panel_agent_tokens:
         raise HTTPException(403, "Personal agent session required")
-    ticket = await run_in_threadpool(db.get, Ticket, ticket_id, with_for_update=True)
+    await run_in_threadpool(_claim_ticket, db, ticket_id, agent)
+    return RedirectResponse(f"/ui/tickets/{ticket_id}", status_code=303)
+
+
+def _claim_ticket(db: Session, ticket_id: uuid.UUID, agent: str) -> None:
+    ticket = db.get(Ticket, ticket_id, with_for_update=True)
     if ticket is None:
         raise HTTPException(404, "Ticket not found")
     if ticket.assigned_agent not in {None, agent} or ticket.status in {"closed", "resolved"}:
@@ -416,7 +420,6 @@ async def panel_claim_ticket(ticket_id: uuid.UUID, request: Request, db: Session
         db.add(AuditLog(action="ticket.claimed", entity_type="ticket", entity_id=ticket.id,
                         details={"agent": agent}))
     db.commit()
-    return RedirectResponse(f"/ui/tickets/{ticket.id}", status_code=303)
 
 
 
@@ -432,6 +435,28 @@ async def panel_add_ticket_message(ticket_id: uuid.UUID, request: Request,
         return payload
     form = await _panel_form(request, {"body", "csrf_token"})
     _validate_panel_csrf(form, payload)
+    prepared = await run_in_threadpool(_prepare_ticket_reply, db, ticket_id, form, request, payload)
+    if isinstance(prepared, Response):
+        return prepared
+    saved_message, chat_id = prepared
+    if chat_id is not None and settings.telegram_token:
+        try:
+            await send_telegram_message(chat_id, saved_message.body)
+        except HTTPException as exc:
+            if exc.status_code != 503:
+                raise
+            status = "unconfirmed"
+        else:
+            status = "accepted"
+        await run_in_threadpool(_record_reply_delivery, db, saved_message, status)
+    return RedirectResponse(
+        f"/ui/tickets/{ticket_id}?message_id={saved_message.id}", status_code=303
+    )
+
+
+def _prepare_ticket_reply(
+    db: Session, ticket_id: uuid.UUID, form: dict, request: Request, payload: dict,
+) -> Response | tuple[Message, str | None]:
     ticket = db.get(Ticket, ticket_id)
     if ticket is None:
         raise HTTPException(404, "Ticket not found")
@@ -485,28 +510,21 @@ async def panel_add_ticket_message(ticket_id: uuid.UUID, request: Request,
     saved_message = record_ticket_message(
         db, ticket, data, telegram_delivery_status=delivery_status
     )
-    if recipient is not None and settings.telegram_token:
-        try:
-            await send_telegram_message(recipient.telegram_chat_id, saved_message.body)
-        except HTTPException as exc:
-            if exc.status_code != 503:
-                raise
-            saved_message.telegram_delivery_status = "unconfirmed"
-        else:
-            saved_message.telegram_delivery_status = "accepted"
-        saved_message.telegram_delivery_updated_at = datetime.now(timezone.utc)
-        db.add(saved_message)
-        try:
-            db.commit()
-        except SQLAlchemyError as exc:
-            db.rollback()
-            logger.warning(
-                "Could not persist Telegram delivery outcome (message_id=%s, error_type=%s)",
-                saved_message.id, type(exc).__name__,
-            )
-    return RedirectResponse(
-        f"/ui/tickets/{ticket.id}?message_id={saved_message.id}", status_code=303
-    )
+    return saved_message, recipient.telegram_chat_id if recipient is not None else None
+
+
+def _record_reply_delivery(db: Session, saved_message: Message, status: str) -> None:
+    saved_message.telegram_delivery_status = status
+    saved_message.telegram_delivery_updated_at = datetime.now(timezone.utc)
+    db.add(saved_message)
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.warning(
+            "Could not persist Telegram delivery outcome (message_id=%s, error_type=%s)",
+            saved_message.id, type(exc).__name__,
+        )
 
 
 
@@ -538,7 +556,7 @@ async def panel_update_ticket(ticket_id: uuid.UUID, request: Request,
 
 
 @router.get("/ui/knowledge", response_class=HTMLResponse, responses=describe_responses(303, 403))
-async def panel_knowledge(request: Request, db: Session = Depends(get_db)):
+def panel_knowledge(request: Request, db: Session = Depends(get_db)):
     payload = _panel_session(request, admin_only=True)
     if isinstance(payload, RedirectResponse):
         return payload
@@ -547,9 +565,7 @@ async def panel_knowledge(request: Request, db: Session = Depends(get_db)):
             or any(key != "success" for key, _value in query_pairs)
             or any(len(value) > 500 for _key, value in query_pairs)):
         raise HTTPException(422, "Invalid knowledge-page query")
-    documents = list(db.scalars(
-        select(KnowledgeDocument).order_by(KnowledgeDocument.created_at.desc())
-    ))
+    documents = _list_documents(db)
     return templates.TemplateResponse(
         request=request, name="knowledge.html",
         context={
@@ -558,6 +574,10 @@ async def panel_knowledge(request: Request, db: Session = Depends(get_db)):
             "success": dict(query_pairs).get("success"),
         },
     )
+
+
+def _list_documents(db: Session) -> list[KnowledgeDocument]:
+    return list(db.scalars(select(KnowledgeDocument).order_by(KnowledgeDocument.created_at.desc())))
 
 
 
@@ -578,9 +598,7 @@ async def panel_upload_knowledge(request: Request, db: Session = Depends(get_db)
     try:
         result = await ingest_knowledge_document(file, db)
     except HTTPException as exc:
-        documents = list(db.scalars(
-            select(KnowledgeDocument).order_by(KnowledgeDocument.created_at.desc())
-        ))
+        documents = await run_in_threadpool(_list_documents, db)
         return templates.TemplateResponse(
             request=request, name="knowledge.html",
             context={

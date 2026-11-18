@@ -5,6 +5,7 @@ import io
 from fastapi import HTTPException, UploadFile
 from pypdf import PdfReader
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.config import settings
 from app.gemini import embed
@@ -33,18 +34,29 @@ async def ingest_knowledge_document(file: UploadFile, db: Session) -> dict:
         raise HTTPException(400, "Document contains no extractable text")
     if "\x00" in content:
         raise HTTPException(400, "Document text contains null characters")
+    doc = await run_in_threadpool(_start_indexing, db, name)
+    chunks = [content[i:i + 1200] for i in range(0, len(content), 1000)]
+    try:
+        vectors = [await embed(chunk, task_type="RETRIEVAL_DOCUMENT") for chunk in chunks]
+        return await run_in_threadpool(_finish_indexing, db, doc, chunks, vectors)
+    except Exception:
+        await run_in_threadpool(db.rollback)
+        raise HTTPException(503, "Document indexing failed; verify Gemini API key, model and quota")
+
+
+def _start_indexing(db: Session, name: str) -> KnowledgeDocument:
     doc = KnowledgeDocument(title=name, source_name=name, status="indexing")
     db.add(doc)
     db.flush()
-    chunks = [content[i:i + 1200] for i in range(0, len(content), 1000)]
-    try:
-        for index, chunk in enumerate(chunks):
-            db.add(KnowledgeChunk(document_id=doc.id, chunk_index=index, content=chunk,
-                                  embedding=await embed(chunk, task_type="RETRIEVAL_DOCUMENT"),
-                                  embedding_model=settings.gemini_embedding_model))
-        doc.status = "indexed"
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise HTTPException(503, "Document indexing failed; verify Gemini API key, model and quota")
+    return doc
+
+
+def _finish_indexing(
+    db: Session, doc: KnowledgeDocument, chunks: list[str], vectors: list[list[float]],
+) -> dict:
+    for index, (chunk, vector) in enumerate(zip(chunks, vectors, strict=True)):
+        db.add(KnowledgeChunk(document_id=doc.id, chunk_index=index, content=chunk,
+                              embedding=vector, embedding_model=settings.gemini_embedding_model))
+    doc.status = "indexed"
+    db.commit()
     return {"id": str(doc.id), "title": doc.title, "status": doc.status, "chunks": len(chunks)}

@@ -10,7 +10,7 @@ from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
-from app import main, panel_auth
+from app import knowledge_ingest, main, panel_auth, rag
 from app.db import Base, get_db
 from app.models import (
     AuditLog, Department, KnowledgeChunk, KnowledgeDocument, Message, Ticket, User,
@@ -993,6 +993,135 @@ def test_panel_shows_telegram_queue_and_unconfirmed_reply(api_context, monkeypat
     detail = request("GET", f"/ui/tickets/{ticket.id}", headers=headers)
     assert detail.status_code == 200
     assert detail.text.count("Automatic reply unconfirmed") == 1
+
+
+@pytest.mark.parametrize("operation", ["panel_queue", "rag_search"])
+def test_postgres_lock_wait_does_not_block_another_request(api_context, monkeypatch, operation):
+    _, db = api_context
+    engine = db.get_bind()
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+
+    def request_session():
+        with sessions() as session:
+            yield session
+
+    monkeypatch.setitem(main.app.dependency_overrides, get_db, request_session)
+    if operation == "panel_queue":
+        secret = "local-integration-session-secret-for-tests"
+        monkeypatch.setattr(main.settings, "session_signing_secret", secret)
+        _, cookie = panel_auth.create_session("agent", secret)
+        method, url = "GET", "/ui/tickets"
+        arguments = {"headers": {"Cookie": f"{panel_auth.SESSION_COOKIE}={cookie}"}}
+        lock = "LOCK TABLE tickets IN ACCESS EXCLUSIVE MODE"
+    else:
+        owner = User(display_name="RAG concurrency test")
+        db.add(owner)
+        db.flush()
+        message = Message(requester_id=owner.id, channel="api", body="VPN help")
+        db.add(message)
+        db.commit()
+
+        async def classify(_):
+            return Analysis(summary="VPN help", confidence=0.95, needs_human=False,
+                            suggested_action="Search the knowledge base")
+
+        async def embed(_, *, task_type):
+            assert task_type == "RETRIEVAL_QUERY"
+            return [0.0] * main.settings.embedding_dimensions
+
+        monkeypatch.setattr(main, "analyze", classify)
+        monkeypatch.setattr(rag, "embed", embed)
+        monkeypatch.setattr(main.settings, "workflow_token", "lock-test-token")
+        method, url = "POST", "/api/v1/internal/process-message"
+        arguments = {
+            "headers": {"X-Workflow-Token": "lock-test-token"},
+            "json": {"message_id": str(message.id)},
+        }
+        lock = "LOCK TABLE knowledge_chunks IN ACCESS EXCLUSIVE MODE"
+
+    lock_held = threading.Event()
+    query_waiting = threading.Event()
+    release_lock = threading.Event()
+    lock_released = threading.Event()
+
+    def hold_lock():
+        with engine.begin() as blocker:
+            blocker.exec_driver_sql(lock)
+            blocker_pid = blocker.exec_driver_sql("SELECT pg_backend_pid()").scalar_one()
+            lock_held.set()
+            with engine.connect() as observer:
+                observer = observer.execution_options(isolation_level="AUTOCOMMIT")
+                waiting = text("SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                               "WHERE :pid = ANY(pg_blocking_pids(pid)))")
+                for _ in range(200):
+                    if release_lock.wait(0.02):
+                        break
+                    if observer.execute(waiting, {"pid": blocker_pid}).scalar_one():
+                        query_waiting.set()
+                        # Release even if a synchronous query stalls the event loop.
+                        release_lock.wait(4)
+                        break
+            lock_released.set()
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                     base_url="http://test") as client:
+            blocker = asyncio.create_task(asyncio.to_thread(hold_lock))
+            first = None
+            try:
+                assert await asyncio.to_thread(lock_held.wait, 6)
+                first = asyncio.create_task(client.request(method, url, **arguments))
+                assert await asyncio.to_thread(query_waiting.wait, 6)
+                second = await asyncio.wait_for(client.get("/health/ready"), 3)
+                assert second.status_code == 200
+                assert not lock_released.is_set(), "The second request waited for the PostgreSQL lock"
+                assert not first.done()
+            finally:
+                release_lock.set()
+                await blocker
+                if first is not None:
+                    result = await asyncio.wait_for(first, 6)
+                    assert result.status_code == 200
+
+    asyncio.run(exercise())
+
+@pytest.mark.parametrize("fail_embedding", [False, True])
+def test_knowledge_upload_commits_document_and_chunks_together(api_context, monkeypatch, fail_embedding):
+    request, db = api_context
+    embedding_calls = 0
+
+    async def embed(_, *, task_type):
+        nonlocal embedding_calls
+        assert task_type == "RETRIEVAL_DOCUMENT"
+        embedding_calls += 1
+        if embedding_calls == 2:
+            with Session(db.get_bind()) as reader:
+                assert reader.scalar(select(func.count()).select_from(KnowledgeDocument)) == 0
+                assert reader.scalar(select(func.count()).select_from(KnowledgeChunk)) == 0
+            if fail_embedding:
+                raise RuntimeError("Simulated embedding failure")
+        return [0.0] * main.settings.embedding_dimensions
+
+    monkeypatch.setattr(knowledge_ingest, "embed", embed)
+    response = request(
+        "POST", "/api/v1/knowledge/documents",
+        headers={"Authorization": "Bearer admin-test"},
+        files={"file": ("guide.txt", "VPN reset. " * 130, "text/plain")},
+    )
+    assert embedding_calls == 2
+    with Session(db.get_bind()) as reader:
+        documents = reader.scalars(select(KnowledgeDocument)).all()
+        chunks = reader.scalars(select(KnowledgeChunk).order_by(KnowledgeChunk.chunk_index)).all()
+        if fail_embedding:
+            assert response.status_code == 503
+            assert not documents and not chunks
+        else:
+            assert response.status_code == 201
+            assert len(documents) == 1 and documents[0].status == "indexed"
+            assert [(chunk.document_id, chunk.chunk_index) for chunk in chunks] == [
+                (documents[0].id, 0), (documents[0].id, 1),
+            ]
+
 
 def test_panel_searches_old_tickets_and_preserves_filters(api_context, monkeypatch):
     from app.panel_auth import SESSION_COOKIE, create_session
