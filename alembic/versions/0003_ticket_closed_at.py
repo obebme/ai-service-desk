@@ -16,7 +16,7 @@ def has_closed_at():
 
 
 def upgrade():
-    # 0001 uses current metadata.create_all, so a fresh install may already have it.
+    # Older installations may have received this column from the former 0001 migration.
     if not has_closed_at():
         op.add_column("tickets", sa.Column("closed_at", sa.DateTime(timezone=True), nullable=True))
     op.execute(sa.text(

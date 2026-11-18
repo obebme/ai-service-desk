@@ -107,8 +107,9 @@ ngrok http http://127.0.0.1:18081 --inspect=false
 ## Проверки
 
 - Проверено восстановление PostgreSQL из архива `pg_dump` через `pg_restore` в отдельном контейнере. Количество записей и контрольные суммы SHA‑256 совпали для тикетов, сообщений, статей и фрагментов базы знаний с эмбеддингами. Рабочая база использовалась только для чтения.
-- Установите зависимости: `python -m venv .venv`, затем `.venv/Scripts/python -m pip install -r requirements.txt` (Windows) или `source .venv/bin/activate && pip install -r requirements.txt` (Linux/macOS).
+- Установите тестовые зависимости: `python -m venv .venv`, затем `.venv/Scripts/python -m pip install -r requirements-test.txt` (Windows) или `source .venv/bin/activate && pip install -r requirements-test.txt` (Linux/macOS).
 - Запустите полный набор: `.venv/Scripts/python -m pytest -q -rs`.
+- Для ручной проверки используйте [контрольные вопросы базы знаний](docs/knowledge-checks.md).
 - API integration tests используют отдельную PostgreSQL базу, указанную в `TEST_DATABASE_URL`; тесты создают и удаляют собственную случайную schema и никогда не очищают остальные схемы этой базы.
 - Для Telegram/Gemini и миграций production-путь дополнительно требует живые внешние сервисы; unit tests не отправляют запросы наружу.
 
