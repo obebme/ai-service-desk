@@ -1295,11 +1295,18 @@ def test_telegram_ticket_menu_and_replies(api_context, monkeypatch):
     monkeypatch.setattr(main.settings, "workflow_token", "workflow-test")
     monkeypatch.setattr(main.settings, "telegram_token", "7654:fake")
     deliveries = []
+    texts = []
+    photos = []
 
     async def send(chat_id, message, **kwargs):
         deliveries.append(kwargs.get("reply_markup"))
+        texts.append(message)
+
+    async def send_photo(chat_id, file_id, caption, *, reply_markup):
+        photos.append((chat_id, file_id, caption, reply_markup))
 
     monkeypatch.setattr(message_processing, "send_telegram_message", send)
+    monkeypatch.setattr(message_processing, "send_telegram_photo", send_photo)
 
     class CallbackClient:
         def __init__(self, **kwargs):
@@ -1337,10 +1344,13 @@ def test_telegram_ticket_menu_and_replies(api_context, monkeypatch):
         return {"message": {"message_id": message_id, "chat": {"id": user, "type": "private"},
                             "from": {"id": user}, **fields}}
 
-    def click(click_id, data, user=4321):
+    def callback(click_id, data, user=4321):
         chat = {"id": user, "type": "private"}
-        return submit({"callback_query": {"id": click_id, "from": {"id": user},
-                                          "message": {"message_id": 1, "chat": chat}, "data": data}})
+        return {"callback_query": {"id": click_id, "from": {"id": user},
+                                   "message": {"message_id": 1, "chat": chat}, "data": data}}
+
+    def click(click_id, data, user=4321):
+        return submit(callback(click_id, data, user))
 
     def buttons():
         return {b["text"]: b["callback_data"] for row in deliveries[-1]["inline_keyboard"] for b in row}
@@ -1404,6 +1414,7 @@ def test_telegram_ticket_menu_and_replies(api_context, monkeypatch):
     _, latest = click("history", history)
     assert "Специалист" in latest and "Ответ специалиста" in latest
     assert "Чужое сообщение" not in latest and len(latest) < 4000
+    assert "Открыть скриншот" not in buttons()
     next_part = buttons()["Следующая часть"]
     _, denied = click("foreign-history", next_part, user=1234)
     assert "Ответ специалиста" not in denied and "Конец ответа" not in denied
@@ -1415,6 +1426,27 @@ def test_telegram_ticket_menu_and_replies(api_context, monkeypatch):
     assert "VPN всё ещё недоступен" in text_history
     _, photo_again = click("history-newer", buttons()["Позже"])
     assert "Скриншот" in photo_again
+    photo_action = buttons()["Открыть скриншот"]
+    assert "test-photo" not in photo_action
+    _, denied = click("foreign-photo", photo_action, user=1234)
+    assert "не найден" in denied and not photos
+    open_photo = callback("open-photo", photo_action)
+    opened, caption = submit(open_photo)
+    assert caption == "Скриншот к обращению SD-MENU"
+    assert len(photos) == 1
+    assert photos[0][:3] == ("4321", "test-photo", caption)
+    assert photos[0][3]["inline_keyboard"][0][0]["text"] == "К истории"
+    assert opened.telegram_delivery_status == "accepted"
+    assert _telegram_request(request, open_photo).json()["duplicate"]
+    assert len(photos) == 1
+
+    async def unavailable(*args, **kwargs):
+        raise main.HTTPException(404)
+
+    monkeypatch.setattr(message_processing, "send_telegram_photo", unavailable)
+    click("unavailable-photo", photo_action)
+    assert "Скриншот недоступен" in texts[-1]
+    assert "К истории" in buttons()
 
 
 def test_telegram_question_rate_and_global_queue_cap(api_context, monkeypatch):

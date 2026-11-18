@@ -18,7 +18,9 @@ from app.gemini import GeminiError
 from app.models import Message, Ticket
 from app.rag import search
 from app.schemas import Analysis, TicketCreate
-from app.telegram import HISTORY_ENTRY, MAIN_KEYBOARD, MENU_COMMANDS, followup_prompt, send_telegram_message
+from app.telegram import (
+    HISTORY_ENTRY, MAIN_KEYBOARD, MENU_COMMANDS, followup_prompt, send_telegram_message, send_telegram_photo,
+)
 from app.telegram_limits import QUESTION_NOTICE, lock_ticket_creation, telegram_ticket_retry_after
 from app.ticket_writes import create_ticket
 
@@ -69,7 +71,10 @@ def _ticket_history(db: Session, msg: Message, command: str, argument: str) -> s
         return f"История {ticket.ticket_number}\nВ обращении пока нет сообщений."
 
     body = entry.body
-    if (entry.analysis or {}).get("photo_id"):
+    photo_id = (entry.analysis or {}).get("photo_id")
+    has_photo = (entry.channel == "telegram" and entry.sender_type == "user"
+                 and isinstance(photo_id, str) and 1 <= len(photo_id) <= 512)
+    if has_photo:
         body = "Скриншот" if body == "Screenshot attached" else f"Скриншот\n{body}"
     # Leave room for the header even when every character takes two UTF-16 code units.
     part_size = 1800
@@ -77,7 +82,15 @@ def _ticket_history(db: Session, msg: Message, command: str, argument: str) -> s
     if part >= parts:
         _ticket_buttons(msg, [back])
         return "Часть сообщения не найдена."
+    if command == "/history_photo":
+        _ticket_buttons(msg, [[("К истории", f"history_entry:{entry.id.hex}:{part}")], back])
+        if not has_photo:
+            return "Скриншот не найден."
+        msg.analysis = {**msg.analysis, "reply_photo_id": photo_id}
+        return f"Скриншот к обращению {ticket.ticket_number}"
     rows = []
+    if has_photo:
+        rows.append([("Открыть скриншот", f"history_photo:{entry.id.hex}:{part}")])
     if parts > 1:
         rows.append([
             (label, f"history_entry:{entry.id.hex}:{index}")
@@ -157,9 +170,20 @@ async def _deliver_automatic_reply(db: Session, msg: Message, reply: str) -> Non
         return
     try:
         with _measure_stage(msg.id, "telegram_delivery"):
-            if markup := (msg.analysis or {}).get("reply_markup"):
+            analysis = msg.analysis or {}
+            markup = analysis.get("reply_markup")
+            if photo_id := analysis.get("reply_photo_id"):
+                try:
+                    await send_telegram_photo(msg.telegram_chat_id, photo_id, reply, reply_markup=markup)
+                except HTTPException as exc:
+                    if exc.status_code != 404:
+                        raise
+                    await send_telegram_message(
+                        msg.telegram_chat_id, "Скриншот недоступен в Telegram.", reply_markup=markup,
+                    )
+            elif markup:
                 await send_telegram_message(msg.telegram_chat_id, reply, reply_markup=markup)
-            elif (msg.analysis or {}).get("knowledge_answer") and msg.id:
+            elif analysis.get("knowledge_answer") and msg.id:
                 await send_telegram_message(msg.telegram_chat_id, reply, answer_id=msg.id)
             else:
                 await send_telegram_message(msg.telegram_chat_id, reply)
@@ -219,7 +243,7 @@ def _telegram_ticket_command(db: Session, msg: Message) -> str | None:
             return "Обращение закрыто. Отправьте новый вопрос, чтобы создать новое обращение."
         msg.analysis = {**(msg.analysis or {}), "reply_markup": {"force_reply": True}}
         return followup_prompt(command[1:], ticket.ticket_number)
-    if command in {"/history", "/history_entry"}:
+    if command in {"/history", "/history_entry", "/history_photo"}:
         return _ticket_history(db, msg, command, argument.strip())
     if command == "/add":
         number, _, body = argument.strip().partition(" ")

@@ -206,6 +206,40 @@ def test_saved_telegram_reply_is_delivered_only_once(monkeypatch):
     assert deliveries == [("123", "Saved response")]
     assert msg.telegram_delivery_status == "accepted"
 
+
+@pytest.mark.parametrize("status", [200, 400])
+def test_telegram_photo_reuses_file_id(monkeypatch, status):
+    calls = []
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def post(self, url, *, json):
+            calls.append((url, json))
+            return httpx.Response(status, json={"ok": status == 200}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(telegram.settings, "telegram_token", "test-token")
+    monkeypatch.setattr(telegram, "httpx", SimpleNamespace(
+        AsyncClient=Client, HTTPError=httpx.HTTPError, HTTPStatusError=httpx.HTTPStatusError,
+    ))
+    markup = {"inline_keyboard": [[{"text": "К истории", "callback_data": "history:SD-TEST"}]]}
+    if status == 400:
+        with pytest.raises(HTTPException) as error:
+            asyncio.run(telegram.send_telegram_photo("123", "photo-id", "Скриншот", reply_markup=markup))
+        assert error.value.status_code == 404 and "test-token" not in error.value.detail
+    else:
+        asyncio.run(telegram.send_telegram_photo("123", "photo-id", "Скриншот", reply_markup=markup))
+    assert calls == [("https://api.telegram.org/bottest-token/sendPhoto", {
+        "chat_id": "123", "photo": "photo-id", "caption": "Скриншот", "reply_markup": markup,
+    })]
+
 @pytest.mark.parametrize(("needs_human", "priority", "confidence", "reason"), [
     (True, "medium", 0.95, "requires_specialist"),
     (False, "critical", 0.95, "critical"),
