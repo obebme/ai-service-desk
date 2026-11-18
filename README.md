@@ -89,7 +89,7 @@ Docker перезапускает контейнеры ngrok, прокси и м
 
 Если настроен n8n, контейнерный монитор проверяет его webhook раз в цикл. Ответ HTTP 401 или 403 на запрос без токена означает, что маршрут зарегистрирован и защищён. Ошибка соединения или другой статус вызовет оповещение, даже если очередь обработалась напрямую через FastAPI. Проверка охватывает маршрут и проверку доступа, а выполнение workflow проверяется при обработке обращений.
 
-Для проверки снаружи стенда добавьте в секреты репозитория GitHub Actions `STAGING_WEBHOOK_URL` с полным публичным HTTPS-адресом webhook. После появления workflow **External staging webhook** в основной ветке запустите пробный прогон вручную в Actions, затем задайте переменную репозитория `STAGING_WEBHOOK_MONITOR_ENABLED=true` для проверки примерно раз в 10 минут. Включите уведомления GitHub Actions о неудачных запусках по почте или в веб-интерфейсе. [Настройка уведомлений GitHub](https://docs.github.com/en/actions/concepts/workflows-and-actions/notifications-for-workflow-runs). Плановые запуски могут задерживаться, а GitHub отключает расписание в публичных репозиториях после 60 дней без активности. [Ограничения расписания](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
+Для проверки снаружи стенда добавьте в секреты репозитория GitHub Actions `STAGING_WEBHOOK_URL` с полным публичным HTTPS-адресом webhook. Когда стенд и туннель ngrok запущены, в GitHub Actions откройте **External staging webhook** и нажмите **Run workflow** для ветки `main`.
 
 ### Ручной запуск туннеля
 
