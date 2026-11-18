@@ -8,7 +8,7 @@ from time import perf_counter
 
 import httpx
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -19,6 +19,7 @@ from app.models import Message, Ticket
 from app.rag import search
 from app.schemas import Analysis, TicketCreate
 from app.telegram import MAIN_KEYBOARD, MENU_COMMANDS, followup_prompt, send_telegram_message
+from app.telegram_limits import QUESTION_NOTICE, lock_ticket_creation, telegram_ticket_retry_after
 from app.ticket_writes import create_ticket
 
 
@@ -33,6 +34,26 @@ def _ticket_buttons(msg: Message, rows: list[list[tuple[str, str]]]) -> None:
     msg.analysis = {**(msg.analysis or {}), "reply_markup": {"inline_keyboard": [
         [{"text": label, "callback_data": data} for label, data in row] for row in rows
     ]}}
+
+
+def _create_telegram_ticket(db: Session, msg: Message, data: TicketCreate) -> tuple[Ticket | None, str | None]:
+    lock_ticket_creation(db, msg.requester_id)
+    existing = db.scalar(select(Ticket).where(
+        Ticket.requester_id == msg.requester_id,
+        Ticket.status.in_(("open", "in_progress", "waiting_for_user")),
+        func.lower(func.btrim(Ticket.description)) == func.lower(func.btrim(data.description)),
+    ).order_by(Ticket.created_at.desc(), Ticket.id.desc()).limit(1))
+    if existing is not None:
+        _ticket_buttons(msg, [[("Открыть обращение", f"ticket:{existing.ticket_number}")]])
+        return None, f"Такое обращение уже открыто: {existing.ticket_number}. Его можно дополнить из карточки."
+    retry_after = telegram_ticket_retry_after(db, msg.requester_id)
+    if retry_after is not None:
+        _ticket_buttons(msg, [[("Мои обращения", "tickets")]])
+        return None, (
+            "Достигнут лимит: 3 новых обращения за 10 минут. "
+            f"Повторите попытку через {retry_after} сек. или дополните существующее обращение."
+        )
+    return create_ticket(db, msg.requester_id, data), None
 
 
 @contextmanager
@@ -92,6 +113,8 @@ def _telegram_ticket_command(db: Session, msg: Message) -> str | None:
 
     command, _, argument = msg.body.partition(" ")
     command = MENU_COMMANDS.get(msg.body.casefold(), command)
+    if command == "/rate-limit" and (msg.analysis or {}).get("telegram_update_kind") == "notice":
+        return QUESTION_NOTICE
     if command in {"/start", "/help", "/menu"}:
         msg.analysis = {**(msg.analysis or {}), "reply_markup": MAIN_KEYBOARD}
         return "Выберите действие. Также можно сразу написать вопрос."
@@ -170,11 +193,13 @@ def _telegram_ticket_command(db: Session, msg: Message) -> str | None:
             original.analysis = {**analysis, "feedback": "helped"}
             return "Спасибо за обратную связь."
         classification = Analysis.model_validate(analysis["classification"])
-        ticket = create_ticket(db, msg.requester_id, TicketCreate(
+        ticket, limited_reply = _create_telegram_ticket(db, msg, TicketCreate(
             subject=classification.summary.strip()[:240] if len(classification.summary.strip()) >= 3 else "Support request",
             description=original.body, category=classification.category,
             subcategory=classification.subcategory, priority=classification.priority,
         ))
+        if ticket is None:
+            return limited_reply
         original.ticket_id = ticket.id
         original.analysis = {**analysis, "escalation_reason": "user_requested_specialist"}
         _ticket_buttons(msg, [[("Открыть обращение", f"ticket:{ticket.ticket_number}")]])
@@ -268,19 +293,23 @@ def _save_processing_result(
             subcategory=classification.subcategory if classification is not None else "other",
             priority=classification.priority if classification is not None else "medium",
         )
-        ticket = create_ticket(db, msg.requester_id, ticket_data)
-        msg.ticket_id = ticket.id
-        if reason == "ai_error":
-            reply = f"Не удалось завершить автоматическую диагностику. Создал обращение {ticket.ticket_number}."
+        if msg.channel == "telegram":
+            ticket, reply = _create_telegram_ticket(db, msg, ticket_data)
         else:
+            ticket, reply = create_ticket(db, msg.requester_id, ticket_data), None
+        if ticket is not None:
+            msg.ticket_id = ticket.id
+        if ticket is not None and reason == "ai_error":
+            reply = f"Не удалось завершить автоматическую диагностику. Создал обращение {ticket.ticket_number}."
+        elif ticket is not None:
             reply = f"Создал обращение {ticket.ticket_number}. Специалист продолжит разбор."
-        msg.analysis = {"reply": reply, "escalation_reason": reason}
+        msg.analysis = {**(msg.analysis or {}), "reply": reply, "escalation_reason": reason}
         if classification is not None:
             msg.analysis["classification"] = classification.model_dump()
     else:
         answer_text, sources = answer
         reply = f"{answer_text}\n\nИсточник: {', '.join(sources)}"
-        msg.analysis = {"classification": classification.model_dump(), "reply": reply,
+        msg.analysis = {**(msg.analysis or {}), "classification": classification.model_dump(), "reply": reply,
                         "knowledge_answer": answer_text, "sources": sources}
     db.commit()
     return reply

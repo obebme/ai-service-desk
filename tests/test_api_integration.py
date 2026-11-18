@@ -1,6 +1,7 @@
 import asyncio
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -278,6 +279,9 @@ def mocked_webhook_context(monkeypatch):
     monkeypatch.setattr(main.settings, "telegram_webhook_secret", "telegram-test-secret")
     monkeypatch.setattr(main.settings, "n8n_webhook_url", "")
     monkeypatch.setattr(main.settings, "telegram_token", "")
+    monkeypatch.setattr(main, "lock_telegram_queue", lambda _db: None)
+    monkeypatch.setattr(main, "telegram_queue_full", lambda _db, _limit: False)
+    monkeypatch.setattr(main, "update_limit_reached", lambda *_args: False)
     monkeypatch.setattr(
         main, "get_or_create_user",
         lambda *_args: SimpleNamespace(id=uuid.uuid4()),
@@ -683,7 +687,7 @@ def test_n8n_ack_without_result_is_requeued_when_direct_processing_fails(api_con
     msg = db.scalars(select(Message)).one()
     assert msg.processing_due_at is not None
     assert msg.processing_due_at > datetime.now(timezone.utc)
-    assert msg.analysis is None and msg.ticket_id is None
+    assert "reply" not in msg.analysis and msg.ticket_id is None
 
 
 def _seed_retention_rows(db, now):
@@ -812,9 +816,9 @@ def test_concurrent_first_messages_share_one_user(api_context, monkeypatch):
         with sessions() as session:
             yield session
 
-    original = main.get_or_create_user
+    original = main.lock_telegram_queue
 
-    def concurrent_get_or_create(*args):
+    def concurrent_admission(*args):
         barrier.wait(timeout=5)
         return original(*args)
 
@@ -822,7 +826,7 @@ def test_concurrent_first_messages_share_one_user(api_context, monkeypatch):
         return "Saved"
 
     monkeypatch.setitem(main.app.dependency_overrides, get_db, override_db)
-    monkeypatch.setattr(main, "get_or_create_user", concurrent_get_or_create)
+    monkeypatch.setattr(main, "lock_telegram_queue", concurrent_admission)
     monkeypatch.setattr(message_processing, "process_message", process)
 
     async def test_requests():
@@ -1387,3 +1391,105 @@ def test_telegram_ticket_menu_and_replies(api_context, monkeypatch):
         "from": {"id": 7654, "is_bot": True}, "text": prompt,
     }))
     assert stale.ticket_id is None and "закрыто" in reply
+
+
+def test_telegram_question_rate_and_global_queue_cap(api_context, monkeypatch):
+    request, db = api_context
+    monkeypatch.setattr(main.settings, "telegram_webhook_secret", "telegram-test-secret")
+    monkeypatch.setattr(main.settings, "telegram_queue_limit", 13)
+    monkeypatch.setattr(main.settings, "telegram_token", "")
+    engine = db.get_bind()
+
+    def independent_session():
+        with Session(engine, expire_on_commit=False) as session:
+            yield session
+
+    monkeypatch.setitem(main.app.dependency_overrides, get_db, independent_session)
+
+    def update(index, sender=4321, body=None):
+        return {"message": {"message_id": index, "chat": {"id": sender, "type": "private"},
+                            "from": {"id": sender}, "text": body or f"Вопрос {index}"}}
+
+    def send(payload):
+        response = _telegram_request(request, payload)
+        assert response.status_code == 200
+        return response.json()
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        outcomes = list(pool.map(send, [update(i) for i in range(1, 14)]))
+    assert sum(item.get("queued", False) for item in outcomes) == 10
+    assert sum(item.get("limited") == "questions" for item in outcomes) == 3
+    original = next(i for i, result in enumerate(outcomes, start=1) if result.get("queued"))
+    assert send(update(original))["duplicate"]
+    assert send(update(14, body="/tickets"))["queued"]
+    assert db.scalar(select(func.count()).select_from(Message)) == 12  # includes one rate notice
+    notice = db.scalar(select(Message).where(Message.body == "/rate-limit"))
+    assert "reply" not in notice.analysis
+    reply = asyncio.run(message_processing.process_message(db, notice))
+    assert "10 вопросов" in reply
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(send, [update(1, sender=2345), update(1, sender=3456)]))
+    assert sum(item.get("queued", False) for item in outcomes) == 1
+    assert sum(item.get("limited") == "queue" for item in outcomes) == 1
+    queued = select(Message).where(Message.processing_due_at.is_not(None))
+    assert len(db.scalars(queued).all()) == 13
+    for saved in db.scalars(queued):
+        saved.created_at -= timedelta(minutes=2)
+        saved.processing_due_at = None
+    db.commit()
+    assert send(update(15))["queued"]
+
+
+def test_telegram_ticket_limit_applies_to_both_escalation_paths(api_context, monkeypatch):
+    _, db = api_context
+    monkeypatch.setattr(main.settings, "telegram_token", "")
+
+    async def classify(_body):
+        return Analysis(summary="Test issue", priority="critical", confidence=0.99,
+                        suggested_action="escalate")
+
+    monkeypatch.setattr(message_processing, "analyze", classify)
+    owner = User(telegram_user_id="4321")
+    db.add(owner)
+    db.flush()
+    questions = [Message(requester_id=owner.id, channel="telegram", telegram_chat_id="4321",
+                         body=f"Test issue {index}") for index in range(5)]
+    db.add_all(questions)
+    db.commit()
+    engine = db.get_bind()
+
+    def process(message_id):
+        with Session(engine) as session:
+            msg = session.get(Message, message_id)
+            return asyncio.run(message_processing.process_message(session, msg))
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        outcomes = list(pool.map(process, [msg.id for msg in questions]))
+    assert sum(reply.startswith("Создал обращение") for reply in outcomes) == 3
+    assert sum("лимит" in reply.lower() for reply in outcomes) == 2
+    tickets = db.scalars(select(Ticket)).all()
+    assert len(tickets) == 3
+
+    repeated = Message(requester_id=owner.id, channel="telegram", telegram_chat_id="4321",
+                       body=tickets[0].description.upper())
+    original = Message(requester_id=owner.id, channel="telegram", telegram_chat_id="4321",
+                       body="Another issue", analysis={"knowledge_answer": "Try again"})
+    db.add_all([repeated, original])
+    db.flush()
+    original.analysis = {**original.analysis, "classification": asyncio.run(classify("")).model_dump()}
+    clicked = Message(requester_id=owner.id, channel="telegram", telegram_chat_id="4321",
+                      body=f"/specialist {original.id.hex}")
+    db.add(clicked)
+    db.commit()
+    assert tickets[0].ticket_number in process(repeated.id)
+    assert "лимит" in process(clicked.id).lower()
+    assert db.scalar(select(func.count()).select_from(Ticket)) == 3
+    for ticket in tickets:
+        ticket.created_at -= timedelta(minutes=11)
+    db.commit()
+    retry = Message(requester_id=owner.id, channel="telegram", telegram_chat_id="4321",
+                    body=f"/specialist {original.id.hex}")
+    db.add(retry)
+    db.commit()
+    assert process(retry.id).startswith("Создал обращение")
