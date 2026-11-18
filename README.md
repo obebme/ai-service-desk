@@ -36,18 +36,30 @@ FastAPI сохраняет входящее сообщение в PostgreSQL и 
 3. Откройте тикет в [панели](http://localhost:8000/ui/tickets) под персональной учётной записью специалиста и нажмите **Take ticket**. Отправьте ответ из карточки и убедитесь, что он появился в том же чате.
 4. Выберите статус **Closed**, внесите итог в поле **Resolution** и сохраните изменения. Отправьте боту `/tickets`. Рядом с номером обращения появится **«закрыто»**.
 
-## Запуск
+## Установка с нуля
 
-1. Скопируйте `.env.example` в `.env`, замените все токены/пароли и задайте случайный `SESSION_SIGNING_SECRET` (например, `python -c "import secrets; print(secrets.token_urlsafe(32))"`). Не публикуйте `.env`.
+На компьютере или сервере понадобятся Git, Docker с Compose v2 и Python 3 для генерации локальной конфигурации. Команды выполняются из корня клона.
+
+```sh
+git clone https://github.com/obebme/ai-service-desk.git
+cd ai-service-desk
+python scripts/init_env.py
+```
+
+1. Скрипт создаст `.env` с отдельными случайными паролями и токенами. Повторный вызов сохранит существующий файл. Если команда Python называется `python3`, используйте её. Храните `.env` вне Git.
 2. Укажите `GEMINI_API_KEY` из Google AI Studio. Модели по умолчанию заданы в `.env.example`. Для смены embedding-модели при той же размерности переиндексируйте базу знаний командой `docker compose exec api python -m scripts.reembed_knowledge`. Размерность `EMBEDDING_DIMENSIONS` на существующей базе должна соответствовать колонке PostgreSQL: её изменение требует миграции схемы и переиндексации.
-3. Запустите API и PostgreSQL командой `docker compose up -d --build db api`. По умолчанию FastAPI обрабатывает обращения напрямую.
+3. Запустите API и PostgreSQL командой `docker compose up -d --build --wait db api`. По умолчанию FastAPI обрабатывает обращения напрямую.
 4. Compose применит Alembic-миграции до запуска API.
-5. API и Swagger доступны на `http://localhost:8000` и `/docs`; панель — на `http://localhost:8000/ui/login` при локальной loopback-разработке.
-6. Для использования n8n настройте [workflow](n8n/README.md) и активируйте его перед регистрацией webhook Telegram.
+5. Откройте `http://localhost:8000/health/ready` и убедитесь, что ответ приходит с HTTP 200. Swagger доступен на `/docs`, панель на `/ui/login`. Для входа в панель используйте `ADMIN_API_TOKEN` из вашего `.env`. Загрузите свои документы базы знаний или пример из `docs/knowledge`.
+6. n8n подключается по желанию. После запуска основного стека настройте и активируйте [workflow n8n](n8n/README.md).
+
+По умолчанию сервисы привязаны к localhost. Если порт занят, задайте `API_HOST_PORT`, `POSTGRES_HOST_PORT` или `N8N_HOST_PORT` в `.env`. При подключении к БД с хоста обновите порт также в `DATABASE_URL`. Для доступа к панели на удалённом сервере используйте SSH-туннель или HTTPS в доверенной сети.
 
 ### Telegram на тестовом стенде
 
-Остановите прежний туннель, если он уже использует тот же домен ngrok. Задайте в `.env` токен бота и секрет webhook. Создайте локальный файл `.env.telegram` с настройками:
+Создайте своего бота через @BotFather и запишите его токен в `TELEGRAM_TOKEN` в `.env`. Секрет webhook уже создан скриптом настройки. Скопируйте `.env.telegram.example` в `.env.telegram` и укажите свой домен и токен ngrok. Остановите прежний туннель, если он уже использует тот же домен.
+
+Укажите ID вашего чата для оповещений. Если ID неизвестен, отправьте своему новому боту `/start` и получите `message.chat.id` методом `getUpdates` Telegram Bot API до регистрации webhook. Храните токен бота локально. Пример настроек:
 
 ```dotenv
 NGROK_DOMAIN=your-domain.ngrok-free.dev
@@ -63,7 +75,13 @@ TELEGRAM_QUEUE_ALERT_AGE_SECONDS=120
 docker compose --env-file .env --env-file .env.telegram -f compose.yaml -f compose.telegram.yaml up -d --build
 ```
 
-Для маршрута через n8n добавьте `--profile automation` перед `up` и настройте workflow по [инструкции n8n](n8n/README.md). Зарегистрируйте webhook на `https://<NGROK_DOMAIN>/integrations/telegram/webhook` через Telegram Bot API с `secret_token` со значением `TELEGRAM_WEBHOOK_SECRET` и типами обновлений `message` и `callback_query`.
+Для маршрута через n8n добавьте `--profile automation` перед `up` и настройте workflow по [инструкции n8n](n8n/README.md). Замените `your-domain.ngrok-free.dev` своим доменом и выполните команду регистрации webhook:
+
+```sh
+docker compose --env-file .env --env-file .env.telegram -f compose.yaml -f compose.telegram.yaml exec api python -m scripts.register_telegram_webhook https://your-domain.ngrok-free.dev/integrations/telegram/webhook
+```
+
+Команда проверит публичный маршрут и назначит его боту из вашего `.env`. Отправьте боту тестовый вопрос, проверьте ответ в Telegram, затем запросите специалиста и найдите новый тикет в панели.
 
 Docker перезапускает контейнеры ngrok, прокси и мониторинга при сбое и запуске Docker Engine, если их не остановили вручную. Прокси пересылает только POST на маршрут webhook. Монитор примерно раз в минуту сверяет адрес в Telegram, проверяет публичный маршрут и считает необработанные сообщения в PostgreSQL. Оповещение приходит при недоступности webhook, ошибке проверки БД, достижении порога очереди или восстановлении. Статус оповещений хранится в памяти процесса: после перезапуска монитор может повторно сообщить о текущем сбое. Если Bot API недоступен, события остаются в логах контейнера `telegram-monitor`, а отправка повторяется, пока сохраняется обнаруженная проблема.
 
