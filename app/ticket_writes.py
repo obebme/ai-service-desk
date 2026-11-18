@@ -1,4 +1,4 @@
-"""Shared persistence for ticket updates and replies."""
+"""Shared persistence for creating and updating tickets and replies."""
 
 import uuid
 from datetime import datetime, timezone
@@ -8,8 +8,32 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from app.models import AuditLog, Message, Ticket, User
-from app.schemas import MessageCreate, TicketPatch
+from app.models import AuditLog, Department, Message, Ticket, User
+from app.schemas import MessageCreate, TicketCreate, TicketPatch
+
+_DEPARTMENTS = {
+    "network": "network_support", "vpn": "network_support", "internet": "network_support",
+    "account": "system_administration", "authentication": "system_administration",
+    "hardware": "hardware_support", "printer": "hardware_support",
+    "software": "software_support", "security": "security_team",
+}
+
+
+def _route_department(db: Session, category: str, subcategory: str, priority: str):
+    key = "security" if priority == "critical" and "security" in f"{category} {subcategory}".lower() else category.lower()
+    code = _DEPARTMENTS.get(key, _DEPARTMENTS.get(subcategory.lower(), "software_support"))
+    return db.scalar(select(Department).where(Department.code == code))
+
+
+def create_ticket(db: Session, requester_id: uuid.UUID, data: TicketCreate) -> Ticket:
+    dept = _route_department(db, data.category, data.subcategory, data.priority)
+    ticket = Ticket(ticket_number=f"SD-{uuid.uuid4().hex[:10].upper()}", requester_id=requester_id,
+                    department_id=dept.id if dept else None, category=data.category,
+                    subcategory=data.subcategory, priority=data.priority,
+                    subject=data.subject, description=data.description)
+    db.add(ticket)
+    db.flush()
+    return ticket
 
 
 def record_ticket_update(db: Session, ticket_id: uuid.UUID, data: TicketPatch) -> Ticket:

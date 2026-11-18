@@ -6,7 +6,7 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
-from app import main, telegram
+from app import message_processing, telegram
 from app.models import Message
 from app.schemas import Analysis
 
@@ -39,10 +39,10 @@ def test_no_verified_rag_answer_creates_ticket(monkeypatch):
         created.append((user_id, data))
         return SimpleNamespace(id=uuid.uuid4(), ticket_number="SD-TEST")
 
-    monkeypatch.setattr(main, "analyze", fake_analyze)
-    monkeypatch.setattr(main, "search", fake_search)
-    monkeypatch.setattr(main, "create_ticket", fake_create_ticket)
-    reply = asyncio.run(main.process_message(FakeDB(), msg))
+    monkeypatch.setattr(message_processing, "analyze", fake_analyze)
+    monkeypatch.setattr(message_processing, "search", fake_search)
+    monkeypatch.setattr(message_processing, "create_ticket", fake_create_ticket)
+    reply = asyncio.run(message_processing.process_message(FakeDB(), msg))
 
     assert reply == "Создал обращение SD-TEST. Специалист продолжит разбор."
     assert len(created) == 1
@@ -61,9 +61,9 @@ def test_processed_message_reuses_saved_reply_without_new_ticket(monkeypatch):
     async def fail_if_called(*args, **kwargs):
         raise AssertionError("processed messages should not call model or RAG")
 
-    monkeypatch.setattr(main, "analyze", fail_if_called)
-    monkeypatch.setattr(main, "search", fail_if_called)
-    assert asyncio.run(main.process_message(FakeDB(), msg)) == "Saved response"
+    monkeypatch.setattr(message_processing, "analyze", fail_if_called)
+    monkeypatch.setattr(message_processing, "search", fail_if_called)
+    assert asyncio.run(message_processing.process_message(FakeDB(), msg)) == "Saved response"
 
 
 def test_ai_provider_failure_escalates_without_leaking_provider_error(monkeypatch):
@@ -86,9 +86,9 @@ def test_ai_provider_failure_escalates_without_leaking_provider_error(monkeypatc
         tickets.append((user_id, data))
         return SimpleNamespace(id=uuid.uuid4(), ticket_number="SD-AIFAIL")
 
-    monkeypatch.setattr(main, "analyze", fail_analysis)
-    monkeypatch.setattr(main, "create_ticket", create_ticket)
-    reply = asyncio.run(main.process_message(FakeDB(), msg))
+    monkeypatch.setattr(message_processing, "analyze", fail_analysis)
+    monkeypatch.setattr(message_processing, "create_ticket", create_ticket)
+    reply = asyncio.run(message_processing.process_message(FakeDB(), msg))
 
     assert reply == "Не удалось завершить автоматическую диагностику. Создал обращение SD-AIFAIL."
     assert msg.ticket_id is not None
@@ -127,16 +127,16 @@ def test_database_commit_failure_propagates_without_success_reply(monkeypatch):
     async def record_send(_chat_id, reply):
         sent_replies.append(reply)
 
-    monkeypatch.setattr(main.settings, "telegram_token", "test-token")
-    monkeypatch.setattr(main, "analyze", successful_analysis)
-    monkeypatch.setattr(main, "search", no_evidence)
-    monkeypatch.setattr(main, "create_ticket", create_ticket)
-    monkeypatch.setattr(main, "send_telegram_message", record_send)
+    monkeypatch.setattr(message_processing.settings, "telegram_token", "test-token")
+    monkeypatch.setattr(message_processing, "analyze", successful_analysis)
+    monkeypatch.setattr(message_processing, "search", no_evidence)
+    monkeypatch.setattr(message_processing, "create_ticket", create_ticket)
+    monkeypatch.setattr(message_processing, "send_telegram_message", record_send)
 
     sentinel = object()
     no_reply = sentinel
     with pytest.raises(RuntimeError, match="database commit failed"):
-        no_reply = asyncio.run(main.process_message(FakeDB(), msg))
+        no_reply = asyncio.run(message_processing.process_message(FakeDB(), msg))
 
     assert no_reply is sentinel
     assert commit_attempts == [True]
@@ -169,7 +169,7 @@ def test_telegram_delivery_failures_map_to_safe_503(monkeypatch, failure):
                 raise httpx.ConnectError("network details include sensitive data")
             return Response()
 
-    monkeypatch.setattr(main.settings, "telegram_token", "telegram-test-secret")
+    monkeypatch.setattr(message_processing.settings, "telegram_token", "telegram-test-secret")
     monkeypatch.setattr(telegram, "httpx", SimpleNamespace(
         AsyncClient=FakeClient, HTTPError=httpx.HTTPError,
     ))
@@ -197,11 +197,11 @@ def test_saved_telegram_reply_is_delivered_only_once(monkeypatch):
     async def send(chat_id, reply):
         deliveries.append((chat_id, reply))
 
-    monkeypatch.setattr(main.settings, "telegram_token", "test-token")
-    monkeypatch.setattr(main, "send_telegram_message", send)
+    monkeypatch.setattr(message_processing.settings, "telegram_token", "test-token")
+    monkeypatch.setattr(message_processing, "send_telegram_message", send)
     db = FakeDB()
-    assert asyncio.run(main.process_message(db, msg)) == "Saved response"
-    assert asyncio.run(main.process_message(db, msg)) == "Saved response"
+    assert asyncio.run(message_processing.process_message(db, msg)) == "Saved response"
+    assert asyncio.run(message_processing.process_message(db, msg)) == "Saved response"
     assert deliveries == [("123", "Saved response")]
     assert msg.telegram_delivery_status == "accepted"
 
@@ -229,12 +229,12 @@ def test_direct_escalation_skips_knowledge_search(monkeypatch, caplog, needs_hum
         assert data.category == "network"
         return SimpleNamespace(id=uuid.uuid4(), ticket_number="SD-TEST")
 
-    monkeypatch.setattr(main, "analyze", classify)
-    monkeypatch.setattr(main, "search", unexpected)
-    monkeypatch.setattr(main, "grounded_answer", unexpected)
-    monkeypatch.setattr(main, "create_ticket", ticket)
-    with caplog.at_level("INFO", logger=main.logger.name):
-        assert "SD-TEST" in asyncio.run(main.process_message(DB(), msg))
+    monkeypatch.setattr(message_processing, "analyze", classify)
+    monkeypatch.setattr(message_processing, "search", unexpected)
+    monkeypatch.setattr(message_processing, "grounded_answer", unexpected)
+    monkeypatch.setattr(message_processing, "create_ticket", ticket)
+    with caplog.at_level("INFO", logger=message_processing.logger.name):
+        assert "SD-TEST" in asyncio.run(message_processing.process_message(DB(), msg))
     assert "stage=classification" in caplog.text
     assert f"reason={reason}" in caplog.text
     assert msg.body not in caplog.text
@@ -250,9 +250,9 @@ def test_unknown_telegram_command_returns_help_without_classification(monkeypatc
     async def unexpected(*args, **kwargs):
         pytest.fail("An unknown command must not enter AI processing")
 
-    monkeypatch.setattr(main.settings, "telegram_token", "")
-    monkeypatch.setattr(main, "analyze", unexpected)
-    reply = asyncio.run(main.process_message(FakeDB(), msg))
+    monkeypatch.setattr(message_processing.settings, "telegram_token", "")
+    monkeypatch.setattr(message_processing, "analyze", unexpected)
+    reply = asyncio.run(message_processing.process_message(FakeDB(), msg))
     assert reply.startswith("Неизвестная команда.")
     assert "/tickets" in reply and "/add" in reply
     assert msg.ticket_id is None

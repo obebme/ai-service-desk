@@ -1,11 +1,9 @@
 import asyncio
-import logging
 import secrets
 import uuid
-from contextlib import asynccontextmanager, contextmanager, suppress
-from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
 from pathlib import Path
-from time import perf_counter
 
 import httpx
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
@@ -18,24 +16,20 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app import panel_auth
-from app.ai import AIResponseError, analyze, grounded_answer
+from app import message_processing, panel_auth
+from app.ai import analyze
 from app.config import settings
-from app.db import SessionLocal, engine, get_db
-from app.gemini import GeminiError
+from app.db import engine, get_db
 from app.knowledge_ingest import ingest_knowledge_document
-from app.models import AuditLog, Department, KnowledgeDocument, Message, Ticket, User
-from app.rag import search
+from app.models import Department, KnowledgeDocument, Message, Ticket, User
 from app.routers import panel
 from app.schemas import (
     Analysis, MessageCreate, MessageView, TicketCreate, TicketPatch, TicketView,
     WorkflowMessageRequest, describe_responses,
 )
-from app.telegram import send_telegram_message
-from app.ticket_writes import get_or_create_user, record_ticket_message, record_ticket_update
+from app.telegram_worker import run_telegram_worker
+from app.ticket_writes import create_ticket, get_or_create_user, record_ticket_message, record_ticket_update
 
-
-logger = logging.getLogger("uvicorn.error").getChild(__name__)
 
 MAX_UPLOAD_REQUEST_BYTES = 10_250_000
 KNOWLEDGE_UPLOAD_PATHS = {"/ui/knowledge/upload", "/api/v1/knowledge/documents"}
@@ -53,7 +47,7 @@ async def lifespan(app: FastAPI):
             db.execute(insert(Department).values(code=code, name=name)
                        .on_conflict_do_nothing(index_elements=[Department.code]))
         db.commit()
-    worker = asyncio.create_task(_telegram_processing_worker())
+    worker = asyncio.create_task(run_telegram_worker())
     try:
         yield
     finally:
@@ -95,14 +89,6 @@ async def disable_panel_page_caching(request: Request, call_next):
 
 
 bearer = HTTPBearer(auto_error=False)
-DEPARTMENTS = {
-    "network": "network_support", "vpn": "network_support", "internet": "network_support",
-    "account": "system_administration", "authentication": "system_administration",
-    "hardware": "hardware_support", "printer": "hardware_support",
-    "software": "software_support", "security": "security_team",
-}
-
-
 def principal(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     x_telegram_user_id: str | None = Header(default=None),
@@ -125,244 +111,6 @@ def require(*roles):
             raise HTTPException(403, "Insufficient role")
         return role
     return check
-
-
-def route_department(db: Session, category: str, subcategory: str, priority: str):
-    key = "security" if priority == "critical" and "security" in f"{category} {subcategory}".lower() else category.lower()
-    code = DEPARTMENTS.get(key, DEPARTMENTS.get(subcategory.lower(), "software_support"))
-    return db.scalar(select(Department).where(Department.code == code))
-
-
-def create_ticket(db: Session, requester_id: uuid.UUID, data: TicketCreate) -> Ticket:
-    dept = route_department(db, data.category, data.subcategory, data.priority)
-    ticket = Ticket(ticket_number=f"SD-{uuid.uuid4().hex[:10].upper()}", requester_id=requester_id,
-                    department_id=dept.id if dept else None, category=data.category,
-                    subcategory=data.subcategory, priority=data.priority,
-                    subject=data.subject, description=data.description)
-    db.add(ticket)
-    db.flush()
-    return ticket
-
-
-@contextmanager
-def _measure_stage(message_id: uuid.UUID | None, stage: str):
-    started = perf_counter()
-    outcome = "error"
-    try:
-        yield
-        outcome = "ok"
-    finally:
-        logger.info("message_stage message_id=%s stage=%s outcome=%s elapsed_ms=%.1f",
-                    message_id, stage, outcome, (perf_counter() - started) * 1000)
-
-
-def _claim_automatic_reply(db: Session, msg: Message) -> bool:
-    refresh = getattr(db, "refresh", None)
-    if callable(refresh):
-        refresh(msg, with_for_update=True)
-    if msg.telegram_delivery_status in {"accepted", "unconfirmed"}:
-        db.commit()
-        return False
-
-    # Claim delivery before sending. Telegram cannot deduplicate an ambiguous retry.
-    msg.telegram_delivery_status = "unconfirmed"
-    msg.telegram_delivery_updated_at = datetime.now(timezone.utc)
-    db.commit()
-    return True
-
-
-async def _deliver_automatic_reply(db: Session, msg: Message, reply: str) -> None:
-    if msg.channel != "telegram" or not msg.telegram_chat_id or not settings.telegram_token:
-        return
-    if not await run_in_threadpool(_claim_automatic_reply, db, msg):
-        return
-    try:
-        with _measure_stage(msg.id, "telegram_delivery"):
-            if (msg.analysis or {}).get("knowledge_answer") and msg.id:
-                await send_telegram_message(msg.telegram_chat_id, reply, answer_id=msg.id)
-            else:
-                await send_telegram_message(msg.telegram_chat_id, reply)
-    except HTTPException as exc:
-        if exc.status_code != 503:
-            raise
-        logger.warning("telegram_delivery_unconfirmed message_id=%s", msg.id)
-        return
-    msg.telegram_delivery_status = "accepted"
-    msg.telegram_delivery_updated_at = datetime.now(timezone.utc)
-    # A concurrent processor can hold the row lock while this confirmation is saved.
-    await run_in_threadpool(db.commit)
-
-
-def _telegram_ticket_command(db: Session, msg: Message) -> str | None:
-    if msg.channel != "telegram" or not msg.telegram_chat_id:
-        return None
-
-    command, _, argument = msg.body.partition(" ")
-    if command == "/tickets" or msg.body.casefold() == "мои обращения":
-        tickets = list(db.scalars(select(Ticket).where(Ticket.requester_id == msg.requester_id)
-                                  .order_by(Ticket.updated_at.desc(), Ticket.id.desc()).limit(10)))
-        if not tickets:
-            return "У вас пока нет обращений."
-        statuses = {"open": "открыто", "in_progress": "в работе", "waiting_for_user": "ждём вашего ответа",
-                    "resolved": "решено", "closed": "закрыто"}
-        lines = [f"{ticket.ticket_number} · {statuses.get(ticket.status, ticket.status)} · "
-                 f"{ticket.updated_at:%d.%m %H:%M} UTC\n{ticket.subject[:120]}" for ticket in tickets]
-        return "Ваши последние обращения\n\n" + "\n".join(lines) + (
-            "\n\nЧтобы дополнить обращение, отправьте /add НОМЕР текст.")
-    if command == "/add":
-        number, _, body = argument.strip().partition(" ")
-        if not number or (not body.strip() and not (msg.analysis or {}).get("photo_id")):
-            return "Отправьте /add НОМЕР текст. Номер можно найти командой /tickets."
-        ticket = db.scalar(select(Ticket).where(
-            Ticket.requester_id == msg.requester_id, Ticket.ticket_number == number.upper()
-        ).with_for_update())
-        if ticket is None:
-            return "Обращение не найдено. Проверьте номер командой /tickets."
-        if ticket.status == "closed":
-            return "Обращение закрыто. Отправьте новый вопрос, чтобы создать новое обращение."
-        msg.body = body.strip() or "Screenshot attached"
-        msg.ticket_id = ticket.id
-        if ticket.status in {"waiting_for_user", "resolved"}:
-            ticket.status = "in_progress"
-        ticket.updated_at = datetime.now(timezone.utc)
-        return f"Добавил сообщение в обращение {ticket.ticket_number}."
-    if command in {"/helped", "/specialist"}:
-        try:
-            answer_id = uuid.UUID(argument.strip())
-        except ValueError:
-            return "Используйте команду с кодом из ответа бота."
-        original = db.scalar(select(Message).where(
-            Message.id == answer_id, Message.requester_id == msg.requester_id,
-            Message.telegram_chat_id == msg.telegram_chat_id, Message.channel == "telegram",
-            Message.sender_type == "user",
-        ).with_for_update())
-        analysis = original.analysis if original is not None else None
-        if not analysis or not analysis.get("knowledge_answer"):
-            return "Ответ базы знаний не найден."
-        if original.ticket_id:
-            ticket = db.get(Ticket, original.ticket_id)
-            if ticket is not None:
-                return f"Для этого вопроса уже создано обращение {ticket.ticket_number}."
-            return "Для этого вопроса уже создавалось обращение."
-        if command == "/helped":
-            original.analysis = {**analysis, "feedback": "helped"}
-            return "Спасибо за обратную связь."
-        classification = Analysis.model_validate(analysis["classification"])
-        ticket = create_ticket(db, msg.requester_id, TicketCreate(
-            subject=classification.summary.strip()[:240] if len(classification.summary.strip()) >= 3 else "Support request",
-            description=original.body, category=classification.category,
-            subcategory=classification.subcategory, priority=classification.priority,
-        ))
-        original.ticket_id = ticket.id
-        original.analysis = {**analysis, "escalation_reason": "user_requested_specialist"}
-        return f"Создал обращение {ticket.ticket_number}. Специалист продолжит разбор."
-    help_text = (
-        "Мои обращения — /tickets. Дополнить обращение — /add НОМЕР текст. "
-        "Новый вопрос можно отправить обычным сообщением."
-    )
-    if command in {"/help", "/start"}:
-        return help_text
-    if command.startswith("/"):
-        return f"Неизвестная команда. {help_text}"
-    return None
-
-
-async def process_message(db: Session, msg: Message) -> str:
-    refresh = getattr(db, "refresh", None)
-    locked = callable(refresh)
-    if locked:
-        # Waiting for another transaction must leave the event loop free to finish it.
-        await run_in_threadpool(refresh, msg, with_for_update=True)
-    if msg.analysis and msg.analysis.get("reply"):
-        reply = msg.analysis["reply"]
-        if locked:
-            await run_in_threadpool(db.commit)
-        await _deliver_automatic_reply(db, msg, reply)
-        return reply
-    if msg.channel == "telegram" and msg.telegram_chat_id and (
-        msg.body.startswith("/") or msg.body.casefold() == "мои обращения"
-    ):
-        reply = await run_in_threadpool(_telegram_ticket_command, db, msg)
-        if reply is not None:
-            msg.analysis = {**(msg.analysis or {}), "reply": reply}
-            await run_in_threadpool(db.commit)
-            if (callback_id := msg.analysis.get("callback_id")) and settings.telegram_token:
-                try:
-                    async with httpx.AsyncClient(timeout=3) as client:
-                        await client.post(
-                            f"https://api.telegram.org/bot{settings.telegram_token}/answerCallbackQuery",
-                            json={"callback_query_id": callback_id},
-                        )
-                except httpx.HTTPError:
-                    logger.warning("telegram_callback_ack_failed message_id=%s", msg.id)
-            await _deliver_automatic_reply(db, msg, reply)
-            return reply
-    classification = None
-    trusted = []
-    answer = None
-    reason = None
-    try:
-        with _measure_stage(msg.id, "classification"):
-            classification = await analyze(msg.body)
-        if classification.priority == "critical":
-            reason = "critical"
-        elif classification.needs_human:
-            reason = "requires_specialist"
-        elif classification.confidence < settings.confidence_threshold:
-            reason = "low_confidence"
-        else:
-            with _measure_stage(msg.id, "knowledge_search"):
-                passages = await search(db, msg.body, limit=4)
-                trusted = [p for p in passages if p["score"] >= 0.35]
-            if not trusted:
-                reason = "no_relevant_passages"
-            else:
-                with _measure_stage(msg.id, "answer_generation"):
-                    answer = await grounded_answer(msg.body, trusted)
-                if answer is None:
-                    reason = "no_confirmed_solution"
-    except (httpx.HTTPError, GeminiError, AIResponseError) as exc:
-        reason = "ai_error"
-        logger.warning("message_ai_error message_id=%s error_type=%s", msg.id, type(exc).__name__)
-
-    reply = await run_in_threadpool(_save_processing_result, db, msg, classification, reason, answer)
-    logger.info("message_decision message_id=%s reason=%s", msg.id, reason or "knowledge_answer")
-    await _deliver_automatic_reply(db, msg, reply)
-    return reply
-
-
-def _save_processing_result(
-    db: Session, msg: Message, classification: Analysis | None, reason: str | None,
-    answer: tuple[str, list[str]] | None,
-) -> str:
-    if reason is not None:
-        summary = classification.summary if classification is not None else ""
-        subject = summary.strip()[:240].strip()
-        if len(subject) < 3:
-            subject = "Support request"
-        ticket_data = TicketCreate(
-            subject=subject,
-            description=msg.body[:20000],
-            category=classification.category if classification is not None else "other",
-            subcategory=classification.subcategory if classification is not None else "other",
-            priority=classification.priority if classification is not None else "medium",
-        )
-        ticket = create_ticket(db, msg.requester_id, ticket_data)
-        msg.ticket_id = ticket.id
-        if reason == "ai_error":
-            reply = f"Не удалось завершить автоматическую диагностику. Создал обращение {ticket.ticket_number}."
-        else:
-            reply = f"Создал обращение {ticket.ticket_number}. Специалист продолжит разбор."
-        msg.analysis = {"reply": reply, "escalation_reason": reason}
-        if classification is not None:
-            msg.analysis["classification"] = classification.model_dump()
-    else:
-        answer_text, sources = answer
-        reply = f"{answer_text}\n\nИсточник: {', '.join(sources)}"
-        msg.analysis = {"classification": classification.model_dump(), "reply": reply,
-                        "knowledge_answer": answer_text, "sources": sources}
-    db.commit()
-    return reply
 
 
 @app.get("/health/live")
@@ -639,79 +387,6 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
     return {"ok": True, "message_id": str(msg.id), "queued": True}
 
 
-def _claim_telegram_message():
-    with SessionLocal.begin() as db:
-        now = datetime.now(timezone.utc)
-        msg = db.scalar(
-            select(Message).where(Message.processing_due_at <= now)
-            .order_by(Message.processing_due_at, Message.id)
-            .limit(1).with_for_update(skip_locked=True)
-        )
-        if msg is None:
-            return None
-        # A crashed worker leaves a recoverable claim. Normal failures retry sooner.
-        msg.processing_due_at = now + timedelta(minutes=5)
-        return msg.id, msg.processing_due_at
-
-
-def _finish_telegram_attempt(message_id, claim_until, succeeded):
-    with SessionLocal.begin() as db:
-        msg = db.get(Message, message_id, with_for_update=True)
-        if msg is not None and msg.processing_due_at == claim_until:
-            msg.processing_due_at = None if succeeded else datetime.now(timezone.utc) + timedelta(seconds=15)
-
-
-async def _dispatch_telegram_message(message_id):
-    workflow_acknowledged = False
-    if settings.n8n_webhook_url:
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(210, connect=5)) as client:
-                response = await client.post(
-                    settings.n8n_webhook_url, json={"message_id": str(message_id)},
-                    headers={"X-Workflow-Token": settings.n8n_ingress_token},
-                )
-                response.raise_for_status()
-            workflow_acknowledged = True
-        except (httpx.HTTPError, httpx.InvalidURL) as exc:
-            logger.warning("telegram_n8n_fallback message_id=%s error_type=%s",
-                           message_id, type(exc).__name__)
-
-    db = SessionLocal()
-    try:
-        msg = await run_in_threadpool(db.get, Message, message_id)
-        if msg is None:
-            return
-        if workflow_acknowledged:
-            if (msg.analysis or {}).get("reply"):
-                return
-            logger.warning("telegram_n8n_fallback message_id=%s reason=missing_saved_reply", message_id)
-        # A workflow may still be processing this row. Use the same lock and saved result.
-        await process_message(db, msg)
-    finally:
-        await run_in_threadpool(db.close)
-
-
-async def _telegram_processing_worker():
-    while True:
-        try:
-            claim = await run_in_threadpool(_claim_telegram_message)
-            if claim is None:
-                await asyncio.sleep(0.25)
-                continue
-            message_id, claim_until = claim
-            succeeded = False
-            try:
-                await _dispatch_telegram_message(message_id)
-                succeeded = True
-            except Exception as exc:
-                logger.warning("telegram_job_retry message_id=%s error_type=%s",
-                               message_id, type(exc).__name__)
-            await run_in_threadpool(_finish_telegram_attempt, message_id, claim_until, succeeded)
-        except SQLAlchemyError as exc:
-            logger.warning("telegram_queue_error error_type=%s", type(exc).__name__)
-            await asyncio.sleep(2)
-
-
 @app.post("/api/v1/internal/process-message", responses=describe_responses(401, 404))
 async def process_message_from_workflow(payload: WorkflowMessageRequest,
                                         x_workflow_token: str | None = Header(default=None),
@@ -721,4 +396,4 @@ async def process_message_from_workflow(payload: WorkflowMessageRequest,
     msg = await run_in_threadpool(db.get, Message, payload.message_id)
     if msg is None:
         raise HTTPException(404, "Message not found")
-    return {"message_id": str(msg.id), "reply": await process_message(db, msg)}
+    return {"message_id": str(msg.id), "reply": await message_processing.process_message(db, msg)}
