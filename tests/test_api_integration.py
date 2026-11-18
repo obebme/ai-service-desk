@@ -1267,6 +1267,10 @@ def test_telegram_callback_and_screenshot_are_queued_once(api_context, monkeypat
     assert request("POST", route, headers=headers,
                    json={"message_id": response.json()["message_id"]}).status_code == 200
     ticket = db.scalars(select(Ticket)).one()
+    escalation = db.get(Message, uuid.UUID(response.json()["message_id"]))
+    assert escalation.analysis["reply_markup"]["inline_keyboard"] == [[
+        {"text": "Открыть обращение", "callback_data": f"ticket:{ticket.ticket_number}"},
+    ]]
     photo = _telegram_request(request, {"message": {"message_id": 3, "from": sender,
                               "chat": chat, "caption": f"/add {ticket.ticket_number}",
                               "photo": [{"file_id": "telegram-photo-id"}]}})
@@ -1277,3 +1281,99 @@ def test_telegram_callback_and_screenshot_are_queued_once(api_context, monkeypat
     assert attachment.ticket_id == ticket.id
     assert attachment.analysis["photo_id"] == "telegram-photo-id"
     assert attachment.body == "Screenshot attached"
+
+
+def test_telegram_ticket_menu_and_replies(api_context, monkeypatch):
+    from app import message_processing
+
+    request, db = api_context
+    monkeypatch.setattr(main.settings, "telegram_webhook_secret", "telegram-test-secret")
+    monkeypatch.setattr(main.settings, "workflow_token", "workflow-test")
+    monkeypatch.setattr(main.settings, "telegram_token", "7654:fake")
+    deliveries = []
+
+    async def send(chat_id, message, **kwargs):
+        deliveries.append(kwargs.get("reply_markup"))
+
+    monkeypatch.setattr(message_processing, "send_telegram_message", send)
+
+    class CallbackClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def post(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(message_processing, "httpx", type("HTTP", (), {"AsyncClient": CallbackClient}))
+    owner = User(telegram_user_id="4321")
+    db.add(owner)
+    db.flush()
+    ticket = Ticket(ticket_number="SD-MENU", requester_id=owner.id, subject="VPN",
+                    description="VPN issue", status="waiting_for_user")
+    db.add(ticket)
+    db.commit()
+
+    def submit(update):
+        response = _telegram_request(request, update)
+        assert response.status_code == 200 and response.json()["queued"]
+        message_id = response.json()["message_id"]
+        processed = request("POST", "/api/v1/internal/process-message",
+                            headers={"X-Workflow-Token": "workflow-test"},
+                            json={"message_id": message_id})
+        assert processed.status_code == 200
+        return db.get(Message, uuid.UUID(message_id)), processed.json()["reply"]
+
+    def message(message_id, user=4321, **fields):
+        return {"message": {"message_id": message_id, "chat": {"id": user, "type": "private"},
+                            "from": {"id": user}, **fields}}
+
+    def click(click_id, data, user=4321):
+        chat = {"id": user, "type": "private"}
+        return submit({"callback_query": {"id": click_id, "from": {"id": user},
+                                          "message": {"message_id": 1, "chat": chat}, "data": data}})
+
+    def buttons():
+        return {b["text"]: b["callback_data"] for row in deliveries[-1]["inline_keyboard"] for b in row}
+
+    submit(message(1, text="/start"))
+    assert "Задать вопрос" in buttons()
+    _, listing = click("list", buttons()["Мои обращения"])
+    assert "ждём вашего ответа" in listing
+    card = next(data for label, data in buttons().items() if ticket.ticket_number in label)
+    _, forbidden = click("foreign", card, user=1234)
+    assert ticket.ticket_number not in forbidden and "VPN" not in forbidden
+    _, detail = click("card", card)
+    assert ticket.ticket_number in detail and "VPN" in detail
+    actions = buttons()
+    for index, label, fields in [
+        (2, "Добавить сообщение", {"text": "VPN всё ещё недоступен"}),
+        (3, "Прикрепить скриншот", {"photo": [{"file_id": "test-photo"}]}),
+    ]:
+        _, prompt = click(f"prompt-{index}", actions[label])
+        assert deliveries[-1]["force_reply"] is True
+        update = message(index, reply_to_message={"from": {"id": 7654, "is_bot": True}, "text": prompt},
+                         **fields)
+        attachment, _ = submit(update)
+        assert attachment.ticket_id == ticket.id
+        assert _telegram_request(request, update).json()["duplicate"]
+        if "photo" in fields:
+            assert attachment.analysis["photo_id"] == "test-photo"
+        else:
+            assert attachment.body == fields["text"]
+
+    db.refresh(ticket)
+    assert ticket.status == "in_progress"
+    ticket.status = "closed"
+    db.commit()
+    click("closed", card)
+    assert "Добавить сообщение" not in buttons()
+    stale, reply = submit(message(4, text="Ещё один ответ", reply_to_message={
+        "from": {"id": 7654, "is_bot": True}, "text": prompt,
+    }))
+    assert stale.ticket_id is None and "закрыто" in reply

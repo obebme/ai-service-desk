@@ -27,6 +27,7 @@ from app.schemas import (
     Analysis, MessageCreate, MessageView, TicketCreate, TicketPatch, TicketView,
     WorkflowMessageRequest, describe_responses,
 )
+from app.telegram import MENU_CALLBACKS, TICKET_CALLBACKS, TICKET_NUMBER, replied_ticket_number
 from app.telegram_worker import run_telegram_worker
 from app.ticket_writes import create_ticket, get_or_create_user, record_ticket_message, record_ticket_update
 
@@ -285,10 +286,16 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
                 or not isinstance(callback_id, str) or not 1 <= len(callback_id) <= 80):
             return {"ok": True}
         action, _, answer_id = data.partition(":")
-        if action not in {"helped", "specialist"} or len(answer_id) != 32:
+        if action in MENU_CALLBACKS and data == action:
+            body = f"/{action}"
+        elif action in TICKET_CALLBACKS and TICKET_NUMBER.fullmatch(answer_id):
+            body = f"/{action} {answer_id}"
+        elif action in {"helped", "specialist"} and len(answer_id) == 32:
+            body = f"/{action} {answer_id}"
+        else:
             return {"ok": True}
         update = {"message": {"message_id": origin.get("message_id"), "chat": chat,
-                              "from": callback.get("from"), "text": f"/{action} {answer_id}"}}
+                              "from": callback.get("from"), "text": body}}
 
     # Telegram sends many valid non-message updates (callbacks, membership events, etc.).
     # They do not enter the message-processing flow.
@@ -298,21 +305,23 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
     if not isinstance(message, dict):
         raise HTTPException(400, "Malformed Telegram update")
 
+    chat = message.get("chat")
+    chat_type = chat.get("type") if isinstance(chat, dict) else None
+    reply_number = replied_ticket_number(message) if chat_type == "private" else None
     photo_id = None
     if "text" in message:
         body = message["text"]
     else:
-        body = message.get("caption")
+        body = message.get("caption", "")
         photos = message.get("photo")
-        if not isinstance(body, str) or not body.startswith("/add ") or not isinstance(photos, list) or not photos:
+        if (not isinstance(body, str) or (not reply_number and not body.startswith("/add "))
+                or not isinstance(photos, list) or not photos):
             return {"ok": True}
         photo = photos[-1]
         photo_id = photo.get("file_id") if isinstance(photo, dict) else None
         if not isinstance(photo_id, str) or not 1 <= len(photo_id) <= 512:
             raise HTTPException(400, "Malformed Telegram photo")
-    chat = message.get("chat")
     chat_id = chat.get("id") if isinstance(chat, dict) else None
-    chat_type = chat.get("type") if isinstance(chat, dict) else None
     if (not isinstance(chat, dict)
             or not isinstance(chat_id, int) or isinstance(chat_id, bool)
             or not -(2**63) < chat_id < 2**63
@@ -323,7 +332,7 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
     sender = message.get("from")
     telegram_user_id = sender.get("id") if isinstance(sender, dict) else None
     telegram_message_id = message.get("message_id")
-    if (not isinstance(body, str) or not body.strip()
+    if (not isinstance(body, str) or (not body.strip() and not (photo_id and reply_number))
             or len(body) > 20000
             or not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool)
             or not 0 < telegram_user_id < 2**63
@@ -337,6 +346,8 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
         body.encode("utf-8")
     except UnicodeEncodeError:
         raise HTTPException(400, "Malformed Telegram text update") from None
+    if reply_number and ((photo_id and not body.startswith("/add ")) or not body.startswith("/")):
+        body = f"/add {reply_number} {body}".rstrip()
 
     telegram_id = str(telegram_user_id)
     external_id = f"callback:{callback_id}" if callback_id else f"chat:{chat_id}:{telegram_message_id}"
