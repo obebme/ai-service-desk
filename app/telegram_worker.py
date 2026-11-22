@@ -60,6 +60,8 @@ async def _dispatch_telegram_message(message_id):
         msg = await run_in_threadpool(db.get, Message, message_id)
         if msg is None:
             return
+        if message_processing.gemini_retry_pending(msg):
+            return
         if workflow_acknowledged:
             if (msg.analysis or {}).get("reply"):
                 return

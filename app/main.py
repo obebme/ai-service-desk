@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Uplo
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -422,7 +422,7 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
     return await run_in_threadpool(persist_message)
 
 
-@app.post("/api/v1/internal/process-message", responses=describe_responses(401, 404))
+@app.post("/api/v1/internal/process-message", responses=describe_responses(202, 401, 404))
 async def process_message_from_workflow(payload: WorkflowMessageRequest,
                                         x_workflow_token: str | None = Header(default=None),
                                         db: Session = Depends(get_db)):
@@ -431,4 +431,7 @@ async def process_message_from_workflow(payload: WorkflowMessageRequest,
     msg = await run_in_threadpool(db.get, Message, payload.message_id)
     if msg is None:
         raise HTTPException(404, "Message not found")
-    return {"message_id": str(msg.id), "reply": await message_processing.process_message(db, msg)}
+    reply = await message_processing.process_message(db, msg)
+    if reply is None:
+        return JSONResponse({"message_id": str(msg.id), "status": "retry_scheduled"}, status_code=202)
+    return {"message_id": str(msg.id), "reply": reply}
