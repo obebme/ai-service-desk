@@ -1,7 +1,7 @@
 import asyncio
 import secrets
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,7 +31,7 @@ from app.telegram import (
     HISTORY_ENTRY, MENU_CALLBACKS, MENU_COMMANDS, TICKET_CALLBACKS, TICKET_NUMBER, replied_ticket_number,
 )
 from app.telegram_limits import lock_telegram_queue, telegram_queue_full, update_limit_reached
-from app.telegram_worker import run_telegram_worker
+from app.telegram_worker import run_telegram_workers
 from app.ticket_writes import create_ticket, get_or_create_user, record_ticket_message, record_ticket_update
 
 
@@ -51,13 +51,13 @@ async def lifespan(app: FastAPI):
             db.execute(insert(Department).values(code=code, name=name)
                        .on_conflict_do_nothing(index_elements=[Department.code]))
         db.commit()
-    workers = [asyncio.create_task(run_telegram_worker()) for _ in range(settings.telegram_workers)]
+    workers = asyncio.create_task(run_telegram_workers())
     try:
         yield
     finally:
-        for worker in workers:
-            worker.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
+        workers.cancel()
+        with suppress(asyncio.CancelledError):
+            await workers
 
 
 app = FastAPI(title="AI Service Desk", version="0.1.0", lifespan=lifespan)
