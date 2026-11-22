@@ -1,5 +1,6 @@
 """Classify a message, persist its outcome, and deliver its Telegram reply."""
 
+import asyncio
 import logging
 import uuid
 from contextlib import contextmanager
@@ -27,6 +28,7 @@ from app.ticket_writes import create_ticket
 
 logger = logging.getLogger("uvicorn.error").getChild(__name__)
 GEMINI_RETRY_DELAYS = (15, 30)
+AI_CLAIM_DURATION = timedelta(minutes=5)
 TICKET_STATUSES = {
     "open": "открыто", "in_progress": "в работе", "waiting_for_user": "ждём вашего ответа",
     "resolved": "решено", "closed": "закрыто",
@@ -329,12 +331,47 @@ def _schedule_gemini_retry(db: Session, msg: Message) -> bool:
     return True
 
 
+def _reserve_ai_processing(db: Session, msg: Message, token: str) -> None:
+    msg.analysis = {**(msg.analysis or {}), "ai_processing": {
+        "token": token, "expires_at": (datetime.now(timezone.utc) + AI_CLAIM_DURATION).isoformat(),
+    }}
+    db.commit()
+
+
+def _remove_ai_claim(msg: Message, token: str) -> bool:
+    analysis = dict(msg.analysis or {})
+    if analysis.get("ai_processing", {}).get("token") != token:
+        return False
+    analysis.pop("ai_processing")
+    msg.analysis = analysis
+    return True
+
+
+def _lock_ai_result(db: Session, msg: Message, token: str) -> None:
+    db.refresh(msg, with_for_update=True)
+    if not _remove_ai_claim(msg, token):
+        raise RuntimeError("AI processing claim lost")
+
+
+def _release_ai_processing(db: Session, msg: Message, token: str) -> None:
+    db.rollback()
+    db.refresh(msg, with_for_update=True)
+    _remove_ai_claim(msg, token)
+    db.commit()
+
+
 async def process_message(db: Session, msg: Message) -> str | None:
     refresh = getattr(db, "refresh", None)
     locked = callable(refresh)
     if locked:
-        # Waiting for another transaction must leave the event loop free to finish it.
-        await run_in_threadpool(refresh, msg, with_for_update=True)
+        while True:
+            await run_in_threadpool(refresh, msg, with_for_update=True)
+            claim = (msg.analysis or {}).get("ai_processing")
+            if not claim or datetime.fromisoformat(claim["expires_at"]) <= datetime.now(timezone.utc):
+                break
+            # Another worker or n8n owns the AI call. Wait without locking a row or checking out a connection.
+            await run_in_threadpool(db.commit)
+            await asyncio.sleep(0.1)
     if msg.analysis and msg.analysis.get("reply"):
         reply = msg.analysis["reply"]
         if locked:
@@ -362,13 +399,36 @@ async def process_message(db: Session, msg: Message) -> str | None:
                     logger.warning("telegram_callback_ack_failed message_id=%s", msg.id)
             await _deliver_automatic_reply(db, msg, reply)
             return reply
+    body, message_id = msg.body, msg.id
+    token = uuid.uuid4().hex if locked else None
+    if token is not None:
+        await run_in_threadpool(_reserve_ai_processing, db, msg, token)
+    try:
+        classification, reason, answer, error = await _evaluate_message(db, body, message_id, locked)
+        if token is not None:
+            await run_in_threadpool(_lock_ai_result, db, msg, token)
+        if error is not None:
+            if (isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 429
+                    and await run_in_threadpool(_schedule_gemini_retry, db, msg)):
+                return None
+            logger.warning("message_ai_error message_id=%s error_type=%s", message_id, type(error).__name__)
+        reply = await run_in_threadpool(_save_processing_result, db, msg, classification, reason, answer)
+    except Exception:
+        if token is not None:
+            await run_in_threadpool(_release_ai_processing, db, msg, token)
+        raise
+    logger.info("message_decision message_id=%s reason=%s", message_id, reason or "knowledge_answer")
+    await _deliver_automatic_reply(db, msg, reply)
+    return reply
+
+
+async def _evaluate_message(db: Session, body: str, message_id: uuid.UUID | None, managed_session: bool):
     classification = None
-    trusted = []
     answer = None
     reason = None
     try:
-        with _measure_stage(msg.id, "classification"):
-            classification = await analyze(msg.body)
+        with _measure_stage(message_id, "classification"):
+            classification = await analyze(body)
         if classification.priority == "critical":
             reason = "critical"
         elif classification.needs_human:
@@ -376,27 +436,21 @@ async def process_message(db: Session, msg: Message) -> str | None:
         elif classification.confidence < settings.confidence_threshold:
             reason = "low_confidence"
         else:
-            with _measure_stage(msg.id, "knowledge_search"):
-                passages = await search(db, msg.body, limit=4)
-                trusted = [p for p in passages if p["score"] >= 0.35]
+            with _measure_stage(message_id, "knowledge_search"):
+                passages = await search(db, body, limit=4)
+            if managed_session:
+                await run_in_threadpool(db.commit)
+            trusted = [p for p in passages if p["score"] >= 0.35]
             if not trusted:
                 reason = "no_relevant_passages"
             else:
-                with _measure_stage(msg.id, "answer_generation"):
-                    answer = await grounded_answer(msg.body, trusted)
+                with _measure_stage(message_id, "answer_generation"):
+                    answer = await grounded_answer(body, trusted)
                 if answer is None:
                     reason = "no_confirmed_solution"
     except (httpx.HTTPError, GeminiError, AIResponseError) as exc:
-        if (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429
-                and await run_in_threadpool(_schedule_gemini_retry, db, msg)):
-            return None
-        reason = "ai_error"
-        logger.warning("message_ai_error message_id=%s error_type=%s", msg.id, type(exc).__name__)
-
-    reply = await run_in_threadpool(_save_processing_result, db, msg, classification, reason, answer)
-    logger.info("message_decision message_id=%s reason=%s", msg.id, reason or "knowledge_answer")
-    await _deliver_automatic_reply(db, msg, reply)
-    return reply
+        return classification, "ai_error", None, exc
+    return classification, reason, answer, None
 
 
 def _save_processing_result(

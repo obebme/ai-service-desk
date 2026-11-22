@@ -421,8 +421,8 @@ def test_telegram_duplicate_keeps_one_pending_message(api_context, monkeypatch):
     assert db.scalars(select(Message)).one().processing_due_at is not None
 
 
-def test_concurrent_process_message_runs_ai_once_and_reuses_saved_result(
-        api_context, monkeypatch):
+@pytest.mark.parametrize("claim_expires", [False, True])
+def test_concurrent_process_message_keeps_one_saved_result(api_context, monkeypatch, claim_expires):
     _, db = api_context
     owner = User(telegram_user_id="process-lock-user", display_name="test")
     db.add(owner)
@@ -443,7 +443,8 @@ def test_concurrent_process_message_runs_ai_once_and_reuses_saved_result(
     async def blocked_analysis(_body):
         ai_calls.append(True)
         ai_started.set()
-        assert await asyncio.to_thread(release_ai.wait, 5)
+        if len(ai_calls) == 1:
+            assert await asyncio.to_thread(release_ai.wait, 5)
         return Analysis(
             category="network", subcategory="vpn", priority="medium",
             summary="VPN unavailable", sentiment="neutral", needs_human=True,
@@ -468,21 +469,78 @@ def test_concurrent_process_message_runs_ai_once_and_reuses_saved_result(
 
         first = asyncio.create_task(process())
         assert await asyncio.to_thread(ai_started.wait, 5), "first AI call did not start"
-        second = asyncio.create_task(process())
         try:
-            await asyncio.sleep(0.1)
-            assert len(ai_calls) == 1
+            def read_and_lock():
+                with sessions.begin() as observer:
+                    row = observer.scalar(select(Message).where(Message.id == message_id)
+                                          .with_for_update(nowait=True))
+                    if claim_expires:
+                        row.analysis = {**row.analysis, "ai_processing": {
+                            **row.analysis["ai_processing"],
+                            "expires_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+                        }}
+                    return row.id
+
+            assert await asyncio.to_thread(read_and_lock) == message_id
+            second = asyncio.create_task(process())
+            if claim_expires:
+                await asyncio.wait_for(second, 3)
+            else:
+                await asyncio.sleep(0.1)
+                assert len(ai_calls) == 1
         finally:
             release_ai.set()
-        return await asyncio.wait_for(asyncio.gather(first, second), timeout=10)
+        return await asyncio.wait_for(asyncio.gather(first, second, return_exceptions=True), timeout=10)
 
     first_reply, second_reply = asyncio.run(process_on_one_loop())
 
-    assert len(ai_calls) == 1
-    assert first_reply == second_reply
+    assert isinstance(second_reply, str)
+    if claim_expires:
+        assert len(ai_calls) == 2
+        assert isinstance(first_reply, RuntimeError) and str(first_reply) == "AI processing claim lost"
+    else:
+        assert len(ai_calls) == 1
+        assert first_reply == second_reply
     assert db.scalar(select(func.count()).select_from(Ticket).where(
         Ticket.requester_id == owner_id,
     )) == 1
+
+
+def test_message_processing_releases_database_during_each_gemini_call(api_context, monkeypatch):
+    _, db = api_context
+    owner = User(display_name="Gemini transaction test")
+    db.add(owner)
+    db.flush()
+    message = Message(requester_id=owner.id, channel="api", body="VPN help")
+    db.add(message)
+    db.commit()
+    calls = []
+
+    async def classify(_):
+        assert not db.in_transaction()
+        calls.append("classification")
+        return Analysis(summary="VPN help", confidence=0.95, suggested_action="Search")
+
+    async def embed(_, **kwargs):
+        assert not db.in_transaction()
+        calls.append("embedding")
+        return [1.0]
+
+    def search(session, vector, limit):
+        assert session.scalar(select(1)) == 1
+        return [{"score": 1.0, "content": "Check VPN", "title": "VPN"}]
+
+    async def answer(*args):
+        assert not db.in_transaction()
+        calls.append("answer")
+        return "Check VPN", ["VPN"]
+
+    monkeypatch.setattr(message_processing, "analyze", classify)
+    monkeypatch.setattr(rag, "embed", embed)
+    monkeypatch.setattr(rag, "_search_by_vector", search)
+    monkeypatch.setattr(message_processing, "grounded_answer", answer)
+    assert "Check VPN" in asyncio.run(message_processing.process_message(db, message))
+    assert calls == ["classification", "embedding", "answer"]
 
 
 @pytest.mark.parametrize("outcome", [
