@@ -3,7 +3,7 @@
 import logging
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from time import perf_counter
 
 import httpx
@@ -26,6 +26,7 @@ from app.ticket_writes import create_ticket
 
 
 logger = logging.getLogger("uvicorn.error").getChild(__name__)
+GEMINI_RETRY_DELAYS = (15, 30)
 TICKET_STATUSES = {
     "open": "открыто", "in_progress": "в работе", "waiting_for_user": "ждём вашего ответа",
     "resolved": "решено", "closed": "закрыто",
@@ -306,7 +307,29 @@ def _telegram_ticket_command(db: Session, msg: Message) -> str | None:
     return None
 
 
-async def process_message(db: Session, msg: Message) -> str:
+def gemini_retry_pending(msg: Message) -> bool:
+    not_before = (msg.analysis or {}).get("gemini_retry_not_before")
+    return (msg.channel == "telegram" and msg.processing_due_at is not None
+            and not_before is not None and datetime.fromisoformat(not_before) > datetime.now(timezone.utc))
+
+
+def _schedule_gemini_retry(db: Session, msg: Message) -> bool:
+    if msg.channel != "telegram" or msg.processing_due_at is None:
+        return False
+    analysis = msg.analysis or {}
+    retries = analysis.get("gemini_retry_count", 0)
+    if retries >= len(GEMINI_RETRY_DELAYS):
+        return False
+    delay = GEMINI_RETRY_DELAYS[retries]
+    retry_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+    msg.processing_due_at = retry_at
+    msg.analysis = {**analysis, "gemini_retry_count": retries + 1, "gemini_retry_not_before": retry_at.isoformat()}
+    db.commit()
+    logger.info("gemini_retry_scheduled message_id=%s retry=%d delay_seconds=%d", msg.id, retries + 1, delay)
+    return True
+
+
+async def process_message(db: Session, msg: Message) -> str | None:
     refresh = getattr(db, "refresh", None)
     locked = callable(refresh)
     if locked:
@@ -318,6 +341,9 @@ async def process_message(db: Session, msg: Message) -> str:
             await run_in_threadpool(db.commit)
         await _deliver_automatic_reply(db, msg, reply)
         return reply
+    if gemini_retry_pending(msg):
+        await run_in_threadpool(db.commit)
+        return None
     if msg.channel == "telegram" and msg.telegram_chat_id and (
         msg.body.startswith("/") or msg.body.casefold() in MENU_COMMANDS
     ):
@@ -361,6 +387,9 @@ async def process_message(db: Session, msg: Message) -> str:
                 if answer is None:
                     reason = "no_confirmed_solution"
     except (httpx.HTTPError, GeminiError, AIResponseError) as exc:
+        if (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429
+                and await run_in_threadpool(_schedule_gemini_retry, db, msg)):
+            return None
         reason = "ai_error"
         logger.warning("message_ai_error message_id=%s error_type=%s", msg.id, type(exc).__name__)
 

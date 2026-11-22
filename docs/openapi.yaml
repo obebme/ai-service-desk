@@ -707,6 +707,8 @@ paths:
       responses:
         "200":
           description: Message processed or its saved reply returned.
+        "202":
+          description: A retry after Gemini rate limiting is scheduled for this Telegram message.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":

@@ -586,6 +586,96 @@ def test_n8n_dispatch_requires_saved_result_without_duplicates(api_context, monk
     assert message.processing_due_at is None
 
 
+@pytest.mark.parametrize(("transport", "throttled_attempts"), [
+    ("direct", 2), ("n8n", 3), ("n8n_lost_ack", 2),
+])
+def test_gemini_429_defers_queued_message(api_context, monkeypatch, transport, throttled_attempts):
+    request, db = api_context
+    sessions = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+    monkeypatch.setattr(telegram_worker, "SessionLocal", sessions)
+    monkeypatch.setattr(main.settings, "telegram_webhook_secret", "telegram-test-secret")
+    monkeypatch.setattr(main.settings, "telegram_token", "")
+    monkeypatch.setattr(main.settings, "workflow_token", "workflow-test-secret")
+    monkeypatch.setattr(main.settings, "n8n_webhook_url", "" if transport == "direct" else "http://n8n.test")
+
+    def request_session():
+        with sessions() as session:
+            yield session
+
+    monkeypatch.setitem(main.app.dependency_overrides, get_db, request_session)
+    response = _telegram_request(request, {"message": {
+        "message_id": 1, "from": {"id": 706}, "chat": {"id": 706, "type": "private"},
+        "text": "VPN issue",
+    }})
+    message_id = uuid.UUID(response.json()["message_id"])
+    calls = []
+
+    async def analyze(body):
+        calls.append(body)
+        if len(calls) <= throttled_attempts:
+            httpx.Response(429, request=httpx.Request("POST", "https://gemini.invalid")).raise_for_status()
+        return Analysis(summary=body, confidence=0.95, suggested_action="search")
+
+    async def search(*args, **kwargs):
+        return [{"score": 1.0}]
+
+    async def answer(*args):
+        return "Recovered answer", ["VPN"]
+
+    monkeypatch.setattr(message_processing, "analyze", analyze)
+    monkeypatch.setattr(message_processing, "search", search)
+    monkeypatch.setattr(message_processing, "grounded_answer", answer)
+    real_client = httpx.AsyncClient
+
+    async def scenario():
+        async with real_client(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as api:
+            async def workflow():
+                return await api.post("/api/v1/internal/process-message",
+                                      headers={"X-Workflow-Token": "workflow-test-secret"},
+                                      json={"message_id": str(message_id)})
+
+            async def n8n(outbound):
+                result = await workflow()
+                assert result.status_code == (202 if len(calls) < 3 else 200)
+                if transport == "n8n_lost_ack":
+                    raise httpx.ReadTimeout("no response", request=outbound)
+                return httpx.Response(result.status_code, json=result.json())
+
+            monkeypatch.setattr(telegram_worker.httpx, "AsyncClient", lambda **kwargs: real_client(
+                transport=httpx.MockTransport(n8n), **kwargs))
+            for attempt in (1, 2, 3):
+                claim = telegram_worker._claim_telegram_message()
+                assert claim is not None and claim[0] == message_id
+                await telegram_worker._dispatch_telegram_message(message_id)
+                telegram_worker._finish_telegram_attempt(*claim, True)
+                with sessions.begin() as observer:
+                    message = observer.get(Message, message_id)
+                    assert len(calls) == attempt
+                    if attempt == 3:
+                        assert message.processing_due_at is None
+                        if throttled_attempts == 3:
+                            assert message.analysis["escalation_reason"] == "ai_error"
+                            assert observer.scalar(select(func.count()).select_from(Ticket)) == 1
+                        else:
+                            assert message.analysis["knowledge_answer"] == "Recovered answer"
+                            assert observer.scalar(select(func.count()).select_from(Ticket)) == 0
+                        continue
+                    assert "reply" not in message.analysis and message.ticket_id is None
+                    assert observer.scalar(select(func.count()).select_from(Ticket)) == 0
+                    assert (message.processing_due_at - datetime.now(timezone.utc)).total_seconds() == pytest.approx(
+                        15 * attempt, abs=3)
+                    assert telegram_worker._claim_telegram_message() is None
+                    early = await workflow()
+                    assert early.status_code == 202 and len(calls) == attempt
+                    past = datetime.now(timezone.utc) - timedelta(seconds=1)
+                    message.processing_due_at = past
+                    message.analysis = {**message.analysis, "gemini_retry_not_before": past.isoformat()}
+            result = await workflow()
+            assert result.status_code == 200 and len(calls) == 3
+
+    asyncio.run(scenario())
+
+
 def test_delivery_confirmation_does_not_block_concurrent_reader(api_context, monkeypatch):
     _, db = api_context
     user = User(display_name="Delivery test")
