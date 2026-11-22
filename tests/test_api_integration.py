@@ -565,7 +565,7 @@ def test_n8n_dispatch_requires_saved_result_without_duplicates(api_context, monk
                            "chat": {"id": 706, "type": "private"}, "text": "VPN needs manual review"}}
     queued = _telegram_request(request, payload)
     assert queued.status_code == 200 and queued.json()["queued"]
-    message_id, claim_until = telegram_worker._claim_telegram_message()
+    message_id = uuid.UUID(queued.json()["message_id"])
     classifications = []
     deliveries = []
     processing_calls = []
@@ -615,6 +615,7 @@ def test_n8n_dispatch_requires_saved_result_without_duplicates(api_context, monk
                 else:
                     workflow_task = asyncio.create_task(workflow())
                     await asyncio.wait_for(ai_started.wait(), 3)
+                    asyncio.get_running_loop().call_later(0.1, release_ai.set)
                 raise httpx.ReadTimeout("no response", request=request)
 
             monkeypatch.setattr(message_processing, "analyze", analyze)
@@ -622,10 +623,18 @@ def test_n8n_dispatch_requires_saved_result_without_duplicates(api_context, monk
             monkeypatch.setattr(message_processing, "process_message", process)
             monkeypatch.setattr(telegram_worker.httpx, "AsyncClient", lambda **kwargs: real_client(
                 transport=httpx.MockTransport(n8n), **kwargs))
+            workers = asyncio.create_task(telegram_worker.run_telegram_workers())
             try:
-                await asyncio.wait_for(telegram_worker._dispatch_telegram_message(message_id), 5)
+                async with asyncio.timeout(5):
+                    while True:
+                        with sessions() as observer:
+                            if observer.get(Message, message_id).processing_due_at is None:
+                                break
+                        await asyncio.sleep(0.05)
             finally:
                 release_ai.set()
+                workers.cancel()
+                await asyncio.gather(workers, return_exceptions=True)
                 if workflow_task is not None:
                     await asyncio.wait_for(workflow_task, 5)
             assert len(deliveries) == 1
@@ -634,7 +643,6 @@ def test_n8n_dispatch_requires_saved_result_without_duplicates(api_context, monk
             assert await workflow() == deliveries[0][1]
 
     asyncio.run(scenario())
-    telegram_worker._finish_telegram_attempt(message_id, claim_until, True)
     ticket = db.scalars(select(Ticket)).one()
     message = db.scalars(select(Message)).one()
     assert len(classifications) == len(deliveries) == 1
@@ -704,8 +712,16 @@ def test_gemini_429_defers_queued_message(api_context, monkeypatch, transport, t
             for attempt in (1, 2, 3):
                 claim = telegram_worker._claim_telegram_message()
                 assert claim is not None and claim[0] == message_id
-                await telegram_worker._dispatch_telegram_message(message_id)
-                telegram_worker._finish_telegram_attempt(*claim, True)
+                if transport == "direct":
+                    await telegram_worker._dispatch_telegram_message(message_id)
+                    telegram_worker._finish_telegram_attempt(*claim[:2], True)
+                else:
+                    await telegram_worker._run_n8n_attempt(*claim[:2])
+                    if transport == "n8n_lost_ack" and attempt == 3:
+                        fallback = telegram_worker._claim_telegram_message()
+                        assert fallback is not None and fallback[0] == message_id and fallback[2]
+                        await telegram_worker._dispatch_telegram_message(message_id)
+                        telegram_worker._finish_telegram_attempt(*fallback[:2], True)
                 with sessions.begin() as observer:
                     message = observer.get(Message, message_id)
                     assert len(calls) == attempt
@@ -784,7 +800,7 @@ def test_failed_background_attempt_keeps_message_for_retry(api_context, monkeypa
                     "chat": {"id": 706, "type": "private"}, "text": "Need help"},
     })
     assert response.status_code == 200
-    message_id, first_claim = telegram_worker._claim_telegram_message()
+    message_id, first_claim, _ = telegram_worker._claim_telegram_message()
     assert telegram_worker._claim_telegram_message() is None
     telegram_worker._finish_telegram_attempt(message_id, first_claim, False)
     msg = db.get(Message, message_id)
@@ -823,7 +839,7 @@ def test_n8n_ack_without_result_is_requeued_when_direct_processing_fails(api_con
 
         monkeypatch.setattr(message_processing, "process_message", processing_failed)
         monkeypatch.setattr(telegram_worker, "_finish_telegram_attempt", mark_finished)
-        worker = asyncio.create_task(telegram_worker.run_telegram_worker())
+        worker = asyncio.create_task(telegram_worker.run_telegram_workers())
         try:
             await asyncio.wait_for(finished.wait(), 5)
         finally:
@@ -1001,6 +1017,7 @@ def test_webhook_acknowledges_before_slow_n8n_and_deduplicates_update(api_contex
     monkeypatch.setattr(main.settings, "telegram_webhook_secret", "telegram-test-secret")
     monkeypatch.setattr(main.settings, "workflow_token", "workflow-test-secret")
     monkeypatch.setattr(main.settings, "telegram_token", "telegram-test-token")
+    monkeypatch.setattr(main.settings, "n8n_webhook_url", "http://n8n.test/webhook/incoming")
     payload = {"message": {"message_id": 100, "from": {"id": 999},
                            "chat": {"id": 999, "type": "private"}, "text": "Slow request"}}
     calls = []
@@ -1023,28 +1040,31 @@ def test_webhook_acknowledges_before_slow_n8n_and_deduplicates_update(api_contex
 
     async def scenario():
         started = asyncio.Event()
+        release = asyncio.Event()
         headers = {"X-Telegram-Bot-Api-Secret-Token": "telegram-test-secret"}
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
                                      base_url="http://test") as client:
-            async def slow_n8n(message_id):
+            async def slow_n8n(message_id, claim_until):
                 calls.append(message_id)
                 started.set()
-                await asyncio.sleep(11)
+                await release.wait()
                 r = await client.post("/api/v1/internal/process-message",
                                       headers={"X-Workflow-Token": "workflow-test-secret"},
                                       json={"message_id": str(message_id)})
                 r.raise_for_status()
+                await asyncio.to_thread(telegram_worker._complete_n8n_attempt, message_id, claim_until, True)
 
-            monkeypatch.setattr(telegram_worker, "_dispatch_telegram_message", slow_n8n)
+            monkeypatch.setattr(telegram_worker, "_run_n8n_attempt", slow_n8n)
             first = await asyncio.wait_for(client.post("/integrations/telegram/webhook",
                                                        json=payload, headers=headers), 2)
             assert first.status_code == 200 and first.json()["queued"]
-            worker = asyncio.create_task(telegram_worker.run_telegram_worker())
+            worker = asyncio.create_task(telegram_worker.run_telegram_workers())
             try:
                 await asyncio.wait_for(started.wait(), 2)
                 second = await asyncio.wait_for(client.post("/integrations/telegram/webhook",
                                                             json=payload, headers=headers), 2)
                 assert second.status_code == 200 and second.json()["duplicate"]
+                release.set()
                 for _ in range(135):
                     with sessions() as session:
                         if session.scalars(select(Message)).one().processing_due_at is None:
@@ -1066,6 +1086,78 @@ def test_webhook_acknowledges_before_slow_n8n_and_deduplicates_update(api_contex
     assert msg.ticket_id == ticket.id
     assert msg.telegram_delivery_status == "accepted"
     assert ticket.ticket_number in deliveries[0][1]
+
+def test_hung_n8n_leaves_four_workers_available_for_local_processing(api_context, monkeypatch):
+    request, db = api_context
+    sessions = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+    monkeypatch.setattr(telegram_worker, "SessionLocal", sessions)
+    monkeypatch.setattr(main.settings, "telegram_webhook_secret", "telegram-test-secret")
+    monkeypatch.setattr(main.settings, "telegram_token", "")
+    monkeypatch.setattr(main.settings, "n8n_webhook_url", "http://n8n.test")
+    monkeypatch.setattr(main.settings, "telegram_workers", 4)
+    real_client = httpx.AsyncClient
+    ai_calls = []
+
+    async def analyze(body):
+        ai_calls.append(body)
+        return Analysis(summary=body, needs_human=True, confidence=0.95, suggested_action="review")
+
+    monkeypatch.setattr(message_processing, "analyze", analyze)
+
+    def payload(chat_id):
+        return {"message": {
+            "message_id": 1, "from": {"id": chat_id}, "chat": {"id": chat_id, "type": "private"},
+            "text": f"VPN issue {chat_id}",
+        }}
+
+    for chat_id in range(700, 704):
+        assert _telegram_request(request, payload(chat_id)).json()["queued"]
+
+    async def scenario():
+        n8n_calls = []
+        waiting = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hang(outbound):
+            n8n_calls.append(outbound)
+            if len(n8n_calls) == 4:
+                waiting.set()
+            await release.wait()
+            raise httpx.ReadTimeout("n8n did not respond", request=outbound)
+
+        monkeypatch.setattr(telegram_worker.httpx, "AsyncClient", lambda **kwargs: real_client(
+            transport=httpx.MockTransport(hang), **kwargs))
+        workers = asyncio.create_task(telegram_worker.run_telegram_workers())
+        try:
+            await asyncio.wait_for(waiting.wait(), 5)
+            async with real_client(transport=httpx.ASGITransport(app=main.app),
+                                   base_url="http://test") as client:
+                headers = {"X-Telegram-Bot-Api-Secret-Token": "telegram-test-secret"}
+                later = await client.post("/integrations/telegram/webhook", json=payload(704), headers=headers)
+                replay = await client.post("/integrations/telegram/webhook", json=payload(704), headers=headers)
+            assert later.json()["queued"] and replay.json()["duplicate"]
+            async with asyncio.timeout(3):
+                while "VPN issue 704" not in ai_calls:
+                    await asyncio.sleep(0.05)
+            assert ai_calls == ["VPN issue 704"] and len(n8n_calls) == 4
+            release.set()
+            async with asyncio.timeout(5):
+                while True:
+                    with sessions() as observer:
+                        if not observer.scalar(select(func.count()).select_from(Message).where(
+                                Message.processing_due_at.is_not(None))):
+                            break
+                    await asyncio.sleep(0.05)
+            assert sorted(ai_calls) == [f"VPN issue {chat_id}" for chat_id in range(700, 705)]
+            with sessions() as observer:
+                assert observer.scalar(select(func.count()).select_from(Ticket)) == 5
+        finally:
+            release.set()
+            workers.cancel()
+            await asyncio.gather(workers, return_exceptions=True)
+
+    asyncio.run(scenario())
+
 
 def test_telegram_accepts_reply_but_confirmation_is_lost(api_context, monkeypatch):
     request, db = api_context

@@ -338,6 +338,11 @@ def _reserve_ai_processing(db: Session, msg: Message, token: str) -> None:
     db.commit()
 
 
+def ai_processing_active(msg: Message) -> bool:
+    claim = (msg.analysis or {}).get("ai_processing")
+    return bool(claim and datetime.fromisoformat(claim["expires_at"]) > datetime.now(timezone.utc))
+
+
 def _remove_ai_claim(msg: Message, token: str) -> bool:
     analysis = dict(msg.analysis or {})
     if analysis.get("ai_processing", {}).get("token") != token:
@@ -366,8 +371,7 @@ async def process_message(db: Session, msg: Message) -> str | None:
     if locked:
         while True:
             await run_in_threadpool(refresh, msg, with_for_update=True)
-            claim = (msg.analysis or {}).get("ai_processing")
-            if not claim or datetime.fromisoformat(claim["expires_at"]) <= datetime.now(timezone.utc):
+            if not ai_processing_active(msg):
                 break
             # Another worker or n8n owns the AI call. Wait without locking a row or checking out a connection.
             await run_in_threadpool(db.commit)
