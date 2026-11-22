@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     telegram_token: str = ""
     telegram_webhook_secret: str = ""
     telegram_queue_limit: PositiveInt = 100
+    telegram_workers: PositiveInt = 1
     n8n_webhook_url: str = ""
     n8n_ingress_token: str = ""
     workflow_token: str = ""
