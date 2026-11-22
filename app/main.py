@@ -263,7 +263,7 @@ def overview(role: str = Depends(require("agent", "admin")), db: Session = Depen
         select(Ticket.status, func.count()).group_by(Ticket.status)).all()}
 
 
-@app.post("/integrations/telegram/webhook", responses=describe_responses(400, 401))
+@app.post("/integrations/telegram/webhook", responses=describe_responses(400, 401, 503))
 async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: str | None = Header(default=None),
                            db: Session = Depends(get_db)):
     if not settings.telegram_webhook_secret or not secrets.compare_digest(
@@ -385,7 +385,7 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
             return {"ok": True, "duplicate": True}
         if telegram_queue_full(db, settings.telegram_queue_limit):
             db.commit()
-            return {"ok": True, "limited": "queue"}
+            raise HTTPException(503, "Telegram queue is full")
         user = get_or_create_user(db, telegram_id, name)
         now = datetime.now(timezone.utc)
         limited = update_limit_reached(db, user.id, kind, now)

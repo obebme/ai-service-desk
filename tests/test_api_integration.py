@@ -1484,11 +1484,29 @@ def test_telegram_question_rate_and_global_queue_cap(api_context, monkeypatch):
     reply = asyncio.run(message_processing.process_message(db, notice))
     assert "10 вопросов" in reply
 
+    competing = [update(1, sender=2345), update(1, sender=3456)]
     with ThreadPoolExecutor(max_workers=2) as pool:
-        outcomes = list(pool.map(send, [update(1, sender=2345), update(1, sender=3456)]))
-    assert sum(item.get("queued", False) for item in outcomes) == 1
-    assert sum(item.get("limited") == "queue" for item in outcomes) == 1
+        responses = list(pool.map(lambda payload: _telegram_request(request, payload), competing))
+    assert sorted(response.status_code for response in responses) == [200, 503]
+    rejected_index = next(i for i, response in enumerate(responses) if response.status_code == 503)
+    assert responses[rejected_index].json()["detail"] == "Telegram queue is full"
+    retry_payload = competing[rejected_index]
+    retry_sender = retry_payload["message"]["from"]["id"]
+    existing_retry = select(Message).where(
+        Message.channel == "telegram", Message.external_message_id == f"chat:{retry_sender}:1",
+    )
+    assert db.scalar(existing_retry) is None
+    assert send(competing[1 - rejected_index])["duplicate"]
     queued = select(Message).where(Message.processing_due_at.is_not(None))
+    pending = db.scalars(queued).all()
+    assert len(pending) == 13
+    pending[0].processing_due_at = None
+    db.commit()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(send, [retry_payload, retry_payload]))
+    assert sum(item.get("queued", False) for item in outcomes) == 1
+    assert sum(item.get("duplicate", False) for item in outcomes) == 1
+    assert len(db.scalars(existing_retry).all()) == 1
     assert len(db.scalars(queued).all()) == 13
     for saved in db.scalars(queued):
         saved.created_at -= timedelta(minutes=2)

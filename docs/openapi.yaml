@@ -681,6 +681,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Telegram queue is full. The update can be retried.
   /api/v1/internal/process-message:
     post:
       tags: [Integrations]
