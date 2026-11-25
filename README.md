@@ -90,11 +90,16 @@ flowchart TB
     API <--> Panel["Панель<br/>специалиста"]
     API -.-> N8N["n8n<br/>опционально"]
 
+    %% Reserve space for the GitHub viewer controls below the dependency row.
+    N8N ~~~ Spacer["&nbsp;<br/>&nbsp;<br/>&nbsp;"]
+
     classDef default fill:#132B45,stroke:#72A7DF,color:#F8FAFC,stroke-width:2px,font-weight:600;
     classDef core fill:#075052,stroke:#65DCCB,color:#F8FAFC,stroke-width:2px,font-weight:700;
     classDef optional fill:#242E42,stroke:#A8B9D0,color:#F8FAFC,stroke-width:2px,stroke-dasharray:5 4,font-weight:600;
+    classDef spacer fill:transparent,stroke:transparent,color:transparent;
     class API core;
     class N8N optional;
+    class Spacer spacer;
     linkStyle default stroke:#7C8CA4,stroke-width:2.5px;
 ```
 
