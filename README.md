@@ -100,7 +100,7 @@ flowchart TB
     class API core;
     class N8N optional;
     class Spacer spacer;
-    linkStyle default stroke:#7C8CA4,stroke-width:2.5px;
+    linkStyle 0,1,2,3,4,5,6 stroke:#7C8CA4,stroke-width:2.5px;
 ```
 
 Фильтр публикует только маршрут Telegram webhook с проверкой секрета. Панель локального стенда доступна через `localhost`. [Модель данных и потоки запросов](docs/ARCHITECTURE.md)
