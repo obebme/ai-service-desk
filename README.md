@@ -67,14 +67,40 @@ Compose применит миграции Alembic перед запуском AP
 FastAPI сохраняет сообщение в PostgreSQL и подтверждает приём Telegram. Фоновый обработчик классифицирует вопрос через Gemini. Если вопрос подходит для автоматического ответа, pgvector находит фрагменты статей, а Gemini формирует ответ из этих фрагментов. Специалист работает с тикетами в веб-панели. При сбое опционального маршрута через n8n обработка продолжается внутри FastAPI.
 
 ```mermaid
-flowchart TD
-    Telegram["Telegram"] --> Ingress["ngrok и фильтр webhook"]
-    Ingress --> API["FastAPI и фоновые обработчики"]
-    API -->|"Ответ в чат"| Telegram
-    API <-->|"Тикеты, очередь, статьи"| DB[("PostgreSQL и pgvector")]
-    API <-->|"Классификация и ответы"| AI["Gemini API"]
-    API <-->|"Тикеты и ответы"| Panel["Панель специалиста"]
-    API -.->|"Опциональный маршрут"| N8N["n8n"]
+---
+config:
+  theme: base
+  themeVariables:
+    fontSize: "22px"
+    lineColor: "#7C8CA4"
+  flowchart:
+    nodeSpacing: 14
+    rankSpacing: 38
+    diagramPadding: 8
+---
+flowchart TB
+    accTitle: Поток обращений AI Service Desk
+    accDescr: Telegram отправляет сообщение через фильтр webhook в FastAPI. FastAPI отвечает в чат и взаимодействует с PostgreSQL, Gemini и панелью специалиста. n8n подключается по желанию.
+
+    Telegram["Telegram"] --> Ingress["ngrok<br/>Фильтр webhook"]
+    Ingress --> API["FastAPI<br/>Фоновые задачи"]
+    API --> Telegram
+    API <--> DB[("PostgreSQL<br/>pgvector")]
+    API <--> AI["Gemini API"]
+    API <--> Panel["Панель<br/>специалиста"]
+    API -.-> N8N["n8n<br/>опционально"]
+
+    %% Reserve space for the GitHub viewer controls below the dependency row.
+    N8N ~~~ Spacer["&nbsp;<br/>&nbsp;<br/>&nbsp;"]
+
+    classDef default fill:#132B45,stroke:#72A7DF,color:#F8FAFC,stroke-width:2px,font-weight:600;
+    classDef core fill:#075052,stroke:#65DCCB,color:#F8FAFC,stroke-width:2px,font-weight:700;
+    classDef optional fill:#242E42,stroke:#A8B9D0,color:#F8FAFC,stroke-width:2px,stroke-dasharray:5 4,font-weight:600;
+    classDef spacer fill:transparent,stroke:transparent,color:transparent;
+    class API core;
+    class N8N optional;
+    class Spacer spacer;
+    linkStyle 0,1,2,3,4,5,6 stroke:#7C8CA4,stroke-width:2.5px;
 ```
 
 Фильтр публикует только маршрут Telegram webhook с проверкой секрета. Панель локального стенда доступна через `localhost`. [Модель данных и потоки запросов](docs/ARCHITECTURE.md)
